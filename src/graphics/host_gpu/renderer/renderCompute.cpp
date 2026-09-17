@@ -21,6 +21,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -28,10 +29,12 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -196,7 +199,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args_addr) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -250,14 +254,40 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
 
+	// Indirect arguments produced by an earlier GPU pass (tile lists, culling results) are not
+	// in guest memory yet when the command processor snapshots them. Read them on the GPU, or
+	// drain the GPU when the counts must be converted from thread dimensions on the host.
+	// Global (BDA) stores are not tracked as GPU-modified, so any argument triple that lives in
+	// a cached buffer may hold GPU-written counts the host copy does not reflect.
+	constexpr uint64_t IndirectArgsSize = 3u * sizeof(uint32_t);
+	bool               gpu_indirect     = false;
+	if (indirect_args_addr != 0 &&
+	    (m_context.GetBufferCache().IsRegionRegistered(indirect_args_addr, IndirectArgsSize) ||
+	     m_context.GetBufferCache().IsRegionGpuModified(indirect_args_addr, IndirectArgsSize))) {
+		if (use_thread_dimensions) {
+			m_context.GetBufferCache().ReadMemory(indirect_args_addr, IndirectArgsSize, false);
+			uint32_t args[3] {};
+			if (LibKernel::Memory::TryReadBacking(indirect_args_addr, args, sizeof(args))) {
+				thread_group_x = args[0];
+				thread_group_y = args[1];
+				thread_group_z = args[2];
+				input_info.dispatch_threads_num[0] = thread_group_x;
+				input_info.dispatch_threads_num[1] = thread_group_y;
+				input_info.dispatch_threads_num[2] = thread_group_z;
+			}
+		} else {
+			gpu_indirect = true;
+		}
+	}
+
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (!gpu_indirect && TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	if (!gpu_indirect && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                                 thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -265,21 +295,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
-	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+	static const bool            log_all = std::getenv("KYTY_DEBUG_LOG_DISPATCHES") != nullptr;
+	if ((large_workgroup || has_sampler || log_all) &&
+	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < (log_all ? 100000u : 512u)) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
 		    });
 		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64 " hash=0x%016" PRIx64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
-		     thread_group_z, mode, input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
+		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash, thread_group_x,
+		     thread_group_y, thread_group_z, mode, input_info.threads_num[0],
+		     input_info.threads_num[1], input_info.threads_num[2], program.info.buffers.size(),
+		     program.info.images.size(), sampled_images,
+		     program.info.images.size() - sampled_images, program.info.samplers.size(),
 		     program.bindings.UsesPushData()
 		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
 		         : 0u);
@@ -347,7 +378,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (!gpu_indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -359,8 +390,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	Buffer*  indirect_buffer = nullptr;
+	uint64_t indirect_offset = 0;
+	if (gpu_indirect) {
+		std::tie(indirect_buffer, indirect_offset) = m_context.GetBufferCache().ObtainBuffer(
+		    indirect_args_addr, IndirectArgsSize, false);
+		EXIT_IF(indirect_buffer == nullptr);
+	}
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
@@ -388,7 +425,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (gpu_indirect) {
+		vk_buffer.dispatchIndirect(indirect_buffer->Handle(), indirect_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
