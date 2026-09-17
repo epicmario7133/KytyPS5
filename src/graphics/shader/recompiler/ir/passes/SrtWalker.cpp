@@ -1,10 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <memory>
+#include <string>
+#include <utility>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -489,7 +492,7 @@ public:
 		}
 	}
 
-	State Find(const Inst* key, uint64_t& value) const {
+	State Find(const Inst* key, uint64_t& value, SrtDeps& deps) const {
 		for (auto slot = Slot(key); m_stamps[slot] == m_generation;
 		     slot = (slot + 1u) & (Size - 1u)) {
 			if (m_keys[slot] == key) {
@@ -497,30 +500,33 @@ public:
 					return State::Pending;
 				}
 				value = m_values[slot];
+				deps  = m_deps[slot];
 				return State::Done;
 			}
 		}
 		if (m_spill != nullptr) {
 			if (const auto found = m_spill->find(key); found != m_spill->end()) {
-				if (found->second.second) {
+				if (found->second.pending) {
 					return State::Pending;
 				}
-				value = found->second.first;
+				value = found->second.value;
+				deps  = found->second.deps;
 				return State::Done;
 			}
 		}
 		return State::Missing;
 	}
 
-	void MarkPending(const Inst* key) { Store(key, 0, true); }
+	void MarkPending(const Inst* key) { Store(key, 0, {}, true); }
 
 	// Replaces the pending entry the evaluation started with, or drops it on failure.
-	void Complete(const Inst* key, uint64_t value, bool evaluated) {
+	void Complete(const Inst* key, uint64_t value, const SrtDeps& deps, bool evaluated) {
 		for (auto slot = Slot(key); m_stamps[slot] == m_generation;
 		     slot = (slot + 1u) & (Size - 1u)) {
 			if (m_keys[slot] == key) {
 				if (evaluated) {
 					m_values[slot]  = value;
+					m_deps[slot]    = deps;
 					m_pending[slot] = false;
 				} else {
 					// Leave the key in the probe chain but make it unfindable.
@@ -531,7 +537,7 @@ public:
 		}
 		if (m_spill != nullptr) {
 			if (evaluated) {
-				(*m_spill)[key] = {value, false};
+				(*m_spill)[key] = {value, deps, false};
 			} else {
 				m_spill->erase(key);
 			}
@@ -546,13 +552,18 @@ private:
 		return static_cast<size_t>((bits ^ (bits >> 13u)) * 0x9E3779B1u) & (Size - 1u);
 	}
 
-	void Store(const Inst* key, uint64_t value, bool pending) {
+	struct Spilled {
+		uint64_t value   = 0;
+		SrtDeps  deps;
+		bool     pending = false;
+	};
+
+	void Store(const Inst* key, uint64_t value, const SrtDeps& deps, bool pending) {
 		if (m_count >= Size / 2u) {
 			if (m_spill == nullptr) {
-				m_spill = std::make_unique<
-				    std::unordered_map<const Inst*, std::pair<uint64_t, bool>>>();
+				m_spill = std::make_unique<std::unordered_map<const Inst*, Spilled>>();
 			}
-			(*m_spill)[key] = {value, pending};
+			(*m_spill)[key] = {value, deps, pending};
 			return;
 		}
 		auto slot = Slot(key);
@@ -562,6 +573,7 @@ private:
 		m_stamps[slot]  = m_generation;
 		m_keys[slot]    = key;
 		m_values[slot]  = value;
+		m_deps[slot]    = deps;
 		m_pending[slot] = pending;
 		m_count++;
 	}
@@ -569,12 +581,38 @@ private:
 	// Only the stamps need clearing; the other arrays are valid wherever a stamp matches.
 	std::array<const Inst*, Size> m_keys;
 	std::array<uint64_t, Size>    m_values;
+	std::array<SrtDeps, Size>     m_deps;
 	std::array<uint32_t, Size>    m_stamps {};
 	std::array<bool, Size>        m_pending;
 	uint32_t                      m_generation = 0;
 	size_t                        m_count      = 0;
-	std::unique_ptr<std::unordered_map<const Inst*, std::pair<uint64_t, bool>>> m_spill;
+	std::unique_ptr<std::unordered_map<const Inst*, Spilled>> m_spill;
 };
+
+// Value caches are large (their dependency sets are bitsets); evaluators borrow them from a
+// per-thread pool instead of building one per walk.
+std::vector<std::unique_ptr<ValueCache>>& ValueCachePool() {
+	thread_local std::vector<std::unique_ptr<ValueCache>> pool;
+	return pool;
+}
+
+std::unique_ptr<ValueCache> AcquireValueCache() {
+	auto& pool = ValueCachePool();
+	if (pool.empty()) {
+		return std::make_unique<ValueCache>();
+	}
+	auto cache = std::move(pool.back());
+	pool.pop_back();
+	cache->Reset();
+	return cache;
+}
+
+void ReleaseValueCache(std::unique_ptr<ValueCache> cache) {
+	auto& pool = ValueCachePool();
+	if (pool.size() < 8) {
+		pool.push_back(std::move(cache));
+	}
+}
 
 class Evaluator {
 public:
@@ -582,7 +620,11 @@ public:
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_cache_storage(AcquireValueCache()), m_cache(*m_cache_storage) {}
+	~Evaluator() { ReleaseValueCache(std::move(m_cache_storage)); }
+	Evaluator(const Evaluator&)            = delete;
+	Evaluator& operator=(const Evaluator&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -592,6 +634,16 @@ public:
 		result = static_cast<uint32_t>(wide);
 		return true;
 	}
+
+	// User-data dwords the evaluations since the last call depended on (bit 63 set for
+	// registers beyond 64).
+	SrtDeps TakeDependencies() { return std::exchange(m_deps, SrtDeps {}); }
+	[[nodiscard]] const SrtDeps& PeekDependencies() const { return m_deps; }
+
+	struct ReadProbe {
+		uint64_t pair_reads = 0, other_reads = 0, other_deps = 0;
+	};
+	void SetReadProbe(ReadProbe* probe) { m_read_probe = probe; }
 
 private:
 	static float Float32(uint64_t bits) {
@@ -621,17 +673,23 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		switch (m_cache.Find(inst, result)) {
-			case ValueCache::State::Done: return true;
+		SrtDeps cached_deps;
+		switch (m_cache.Find(inst, result, cached_deps)) {
+			case ValueCache::State::Done: m_deps.Merge(cached_deps); return true;
 			case ValueCache::State::Pending: return false; // cycle
 			case ValueCache::State::Missing: break;
 		}
 		m_cache.MarkPending(inst);
 		m_depth++;
-		uint64_t   out       = 0;
-		const bool evaluated = EvaluateInst(*inst, out);
+		const auto parent_deps = m_deps;
+		m_deps                 = {};
+		uint64_t   out         = 0;
+		const bool evaluated   = EvaluateInst(*inst, out);
+		const auto deps        = m_deps;
+		m_deps                 = parent_deps;
+		m_deps.Merge(deps);
 		m_depth--;
-		m_cache.Complete(inst, out, evaluated);
+		m_cache.Complete(inst, out, deps, evaluated);
 		if (!evaluated) {
 			if (m_depth == 0) {
 				std::fprintf(stderr, "shader SRT evaluation: hash=0x%016llx cannot evaluate %.*s\n",
@@ -706,9 +764,30 @@ private:
 		uint64_t low    = 0;
 		uint64_t high   = 0;
 		uint64_t offset = 0;
-		if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+		const auto deps_before = m_deps;
+		const auto fail        = [&](const SrtDeps& consumed) {
+			m_deps = deps_before;
+			m_deps.Merge(consumed);
 			return false;
+		};
+		m_deps = {};
+		if (!Arg(*handle, 0, low)) {
+			return fail({});
 		}
+		const auto low_deps = std::exchange(m_deps, SrtDeps {});
+		if (!Arg(*handle, 1, high)) {
+			return fail(low_deps);
+		}
+		const auto high_deps = std::exchange(m_deps, SrtDeps {});
+		if (!Arg(inst, 1, offset)) {
+			auto consumed = low_deps;
+			consumed.Merge(high_deps);
+			return fail(consumed);
+		}
+		auto       offset_deps = std::exchange(m_deps, SrtDeps {});
+		auto       consumed    = low_deps;
+		consumed.Merge(high_deps);
+		consumed.Merge(offset_deps);
 		const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		uint64_t   address   = 0;
@@ -716,10 +795,16 @@ private:
 			uint64_t records = 0;
 			uint64_t word3   = 0;
 			if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-				return false;
+				consumed.Merge(m_deps);
+				return fail(consumed);
 			}
+			// The stride and record count of the V# bound the read; what they depend on stays
+			// part of the key even when the base relocates.
+			const auto tail_deps = std::exchange(m_deps, SrtDeps {});
+			offset_deps.Merge(tail_deps);
+			consumed.Merge(tail_deps);
 			if (immediate < 0) {
-				return false;
+				return fail(consumed);
 			}
 			const auto byte_offset =
 			    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
@@ -729,17 +814,82 @@ private:
 			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			if (aligned > size || size - aligned < sizeof(uint32_t)) {
-				return false;
+				return fail(consumed);
 			}
 			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
 			const auto relative = (immediate & ~int64_t {3}) +
 			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 			if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-				return false;
+				return fail(consumed);
 			}
 		}
-		uint32_t word = 0;
+		// Provenance of the address. Relocatable forms: user-data pair (p, p+1) plus an
+		// offset, or the 64-bit value of recorded reads (k, k+1) plus an offset, where the
+		// offset itself depends on nothing but memory and, for a V#, the pair's stride/record
+		// dwords (p+2, p+3). A relocatable read does not make its result depend on its base
+		// (the memo revalidates the bytes at the relocated address); the reads the offset
+		// depends on, and every input of a non-relocatable address, count as data.
+		uint32_t   pair      = UINT32_MAX;
+		uint32_t   base_read = UINT32_MAX;
+		uint64_t   base_value = 0;
+		const bool user_pair =
+		    low_deps.user != 0 && std::popcount(low_deps.user) == 1 && (low_deps.user >> 60u) == 0 &&
+		    low_deps.reads.Empty() && high_deps.user == (low_deps.user << 1u) &&
+		    high_deps.reads.Empty();
+		uint32_t   low_read = 0;
+		uint32_t   high_read = 0;
+		const bool read_pair = !user_pair && low_deps.user == 0 && high_deps.user == 0 &&
+		                       low_deps.reads.Single(low_read) &&
+		                       high_deps.reads.Single(high_read) && high_read == low_read + 1u;
+		if (user_pair) {
+			pair = static_cast<uint32_t>(std::countr_zero(low_deps.user));
+			base_value = static_cast<uint64_t>(m_runtime.user_data[pair]) |
+			             (static_cast<uint64_t>(m_runtime.user_data[pair + 1]) << 32u);
+		} else if (read_pair) {
+			base_read  = low_read;
+			base_value = static_cast<uint64_t>(static_cast<uint32_t>(low)) |
+			             (static_cast<uint64_t>(static_cast<uint32_t>(high)) << 32u);
+		}
+		const uint64_t descriptor_tail =
+		    user_pair ? (low_deps.user << 2u) | (low_deps.user << 3u) : 0;
+		const bool relocatable = (user_pair || read_pair) &&
+		                         (offset_deps.user & ~descriptor_tail) == 0;
+		m_deps = deps_before;
+		if (relocatable) {
+			// The offset's inputs are data; the base is not.
+			m_deps.Merge(offset_deps);
+			if (m_runtime.user_data_mask != nullptr) {
+				*m_runtime.user_data_mask |= offset_deps.user;
+			}
+			if (m_runtime.data_reads != nullptr) {
+				m_runtime.data_reads->Merge(offset_deps.reads);
+			}
+		} else {
+			m_deps.Merge(consumed);
+			if (m_runtime.user_data_mask != nullptr) {
+				*m_runtime.user_data_mask |= consumed.user;
+			}
+			if (m_runtime.data_reads != nullptr) {
+				m_runtime.data_reads->Merge(consumed.reads);
+			}
+		}
+		if (m_read_probe != nullptr) {
+			(relocatable ? m_read_probe->pair_reads : m_read_probe->other_reads)++;
+			if (!relocatable) {
+				m_read_probe->other_deps |= consumed.user;
+			}
+		}
+		uint32_t word       = 0;
+		uint32_t read_index = m_local_reads++;
+		if (m_runtime.note_read != nullptr) {
+			const auto relocated_offset =
+			    relocatable ? static_cast<int64_t>(address - (base_value & AddressMask)) : 0;
+			read_index = m_runtime.note_read(m_runtime.userdata, pair, base_read, relocated_offset);
+		}
+		// The read's own result depends on this read only; its value is compared by a memo
+		// when it reaches a result.
+		m_deps.reads.Add(read_index);
 		if (m_runtime.read_memory != nullptr) {
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return false;
@@ -767,9 +917,7 @@ private:
 					return false;
 				}
 				const auto index = reg - m_program.user_data_base;
-				if (m_runtime.user_data_mask != nullptr && index < 64u) {
-					*m_runtime.user_data_mask |= uint64_t {1} << index;
-				}
+				m_deps.user |= index < 64u ? uint64_t {1} << index : uint64_t {1} << 63u;
 				result = m_runtime.user_data[index];
 				return true;
 			}
@@ -780,7 +928,10 @@ private:
 				Evaluator  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
 				Evaluator  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
 				                  inst.Arg(1));
-				return active.EvaluateWide(inst.Arg(0), result);
+				const bool evaluated = active.EvaluateWide(inst.Arg(0), result);
+				m_deps.Merge(active.PeekDependencies());
+				m_deps.Merge(clean_active.PeekDependencies());
+				return evaluated;
 			}
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
@@ -801,8 +952,10 @@ private:
 				}
 				if (slot.U32() < m_clean_flat_slots.size() &&
 				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
-					return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
-					                                       result);
+					const bool evaluated = m_clean_evaluator->EvaluateWide(
+					    m_program.srt_reads[slot.U32()].value, result);
+					m_deps.Merge(m_clean_evaluator->PeekDependencies());
+					return evaluated;
 				}
 				return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 			}
@@ -1094,8 +1247,12 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	ValueCache                                m_cache;
+	std::unique_ptr<ValueCache>               m_cache_storage;
+	ValueCache&                               m_cache;
 	uint32_t                                  m_depth = 0;
+	SrtDeps                                   m_deps;
+	uint32_t                                  m_local_reads = 0;
+	ReadProbe*                                m_read_probe = nullptr;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1103,6 +1260,16 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 		return nullptr;
 	}
 	return &program.descriptor_sources[source];
+}
+
+// A value reached a result: its user-data inputs join the key mask and its reads become data.
+void ReportDependencies(const SrtRuntime& runtime, const SrtDeps& deps) {
+	if (runtime.user_data_mask != nullptr) {
+		*runtime.user_data_mask |= deps.user;
+	}
+	if (runtime.data_reads != nullptr) {
+		runtime.data_reads->Merge(deps.reads);
+	}
 }
 
 bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
@@ -1117,14 +1284,50 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    runtime.read_specialization_memory == nullptr) {
 		return false;
 	}
+	Profiler::ScopedBlock setup_block(KYTY_PROFILER_SOURCE("Srt::Setup"));
 	const auto           clean_runtime = CleanRuntime(runtime);
 	Evaluator            clean_evaluator(program, clean_runtime);
 	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	// KYTY_DEBUG_SRT_DEPS=<hex shader hash>: dump the user data and per-source dependencies
+	// of that shader's first walks.
+	static const std::vector<uint64_t> trace_shaders = [] {
+		std::vector<uint64_t> hashes;
+		const char*           value = std::getenv("KYTY_DEBUG_SRT_DEPS");
+		while (value != nullptr && *value != 0) {
+			char* end = nullptr;
+			hashes.push_back(std::strtoull(value, &end, 16));
+			value = (end != nullptr && *end == ',') ? end + 1 : nullptr;
+		}
+		return hashes;
+	}();
+	static std::unordered_map<uint64_t, uint32_t> walk_counters;
+	const bool trace_this = !trace_shaders.empty() &&
+	                        std::ranges::find(trace_shaders, program.shader_hash) != trace_shaders.end() &&
+	                        ++walk_counters[program.shader_hash] <= 2;
+	Evaluator::ReadProbe probe;
+	if (trace_this) {
+		std::string words;
+		for (const auto word: runtime.user_data) {
+			words += fmt::format(" {:08x}", word);
+		}
+		std::fprintf(stderr, "SrtDeps: shader=%016llx user data:%s\n",
+		             static_cast<unsigned long long>(program.shader_hash), words.c_str());
+		evaluator.SetReadProbe(&probe);
+	}
+	setup_block.End();
+	Profiler::ScopedBlock flow_block(KYTY_PROFILER_SOURCE("Srt::ControlFlow"));
 	std::vector<uint8_t> active;
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
 	}
-	if (evaluate_flat && !program.control_flow.empty()) {
+	if (evaluate_flat && !program.control_flow.empty() &&
+	    runtime.prefilled_active.size() == active.size()) {
+		std::copy(runtime.prefilled_active.begin(), runtime.prefilled_active.end(),
+		          active.begin());
+	} else if (evaluate_flat && !program.control_flow.empty()) {
+		if (runtime.active_deps != nullptr) {
+			*runtime.active_deps = {};
+		}
 		for (const auto& block: program.control_flow) {
 			for (const auto source: block.sources) {
 				active.at(source) = 0u;
@@ -1145,14 +1348,22 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 			uint32_t condition = 0;
 			// A missing clean reader must never fall through to the evaluator's raw-memory path.
+			(void)clean_evaluator.TakeDependencies();
 			if (!block.condition.IsEmpty() && runtime.read_specialization_memory != nullptr &&
 			    clean_evaluator.Evaluate(block.condition, condition)) {
 				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 			} else {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 			}
+			const auto condition_deps = clean_evaluator.TakeDependencies();
+			ReportDependencies(runtime, condition_deps);
+			if (runtime.active_deps != nullptr) {
+				runtime.active_deps->Merge(condition_deps);
+			}
 		}
 	}
+	flow_block.End();
+	Profiler::ScopedBlock sources_block(KYTY_PROFILER_SOURCE("Srt::Sources"));
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(sources.size());
 	for (const auto source_index: sources) {
@@ -1163,14 +1374,44 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
 		if (!evaluate_flat || active[source_index]) {
+			const bool prefilled = source_index < runtime.prefilled_sources.size() &&
+			                       runtime.prefilled_sources[source_index] != 0u &&
+			                       source_index < runtime.prefilled_values.size();
+			if (prefilled) {
+				value = runtime.prefilled_values[source_index];
+				evaluated.push_back(value);
+				continue;
+			}
+			(void)evaluator.TakeDependencies();
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
 					return false;
 				}
 			}
+			ReportDependencies(runtime, evaluator.PeekDependencies());
+			if (runtime.source_masks != nullptr) {
+				if (runtime.source_masks->size() < program.descriptor_sources.size()) {
+					runtime.source_masks->assign(program.descriptor_sources.size(), ~uint64_t {0});
+				}
+				(*runtime.source_masks)[source_index] = evaluator.PeekDependencies().user;
+			}
+			if (runtime.source_read_sets != nullptr) {
+				if (runtime.source_read_sets->size() < program.descriptor_sources.size()) {
+					runtime.source_read_sets->resize(program.descriptor_sources.size());
+				}
+				(*runtime.source_read_sets)[source_index] = evaluator.PeekDependencies().reads;
+			}
+			if (trace_this) {
+				std::fprintf(stderr, "SrtDeps: shader=%016llx source=%u dwords=%u user_mask=%016llx\n",
+				             static_cast<unsigned long long>(program.shader_hash), source_index,
+				             source->dword_count,
+				             static_cast<unsigned long long>(evaluator.TakeDependencies().user));
+			}
 		}
 		evaluated.push_back(value);
 	}
+	sources_block.End();
+	Profiler::ScopedBlock flat_block(KYTY_PROFILER_SOURCE("Srt::Flat"));
 	std::vector<uint32_t> flattened;
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
@@ -1178,11 +1419,49 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
+			if (read.flat_offset < runtime.prefilled_flat.size() &&
+			    runtime.prefilled_flat[read.flat_offset] != 0u &&
+			    read.flat_offset < runtime.prefilled_flat_values.size() &&
+			    read.flat_offset < flattened.size()) {
+				flattened[read.flat_offset] = runtime.prefilled_flat_values[read.flat_offset];
+				continue;
+			}
+			(void)selected.TakeDependencies();
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
 				return false;
 			}
+			const auto flat_deps = selected.TakeDependencies();
+			ReportDependencies(runtime, flat_deps);
+			if (runtime.flat_masks != nullptr) {
+				if (runtime.flat_masks->size() < flattened.size()) {
+					runtime.flat_masks->assign(flattened.size(), ~uint64_t {0});
+				}
+				(*runtime.flat_masks)[read.flat_offset] = flat_deps.user;
+			}
+			if (runtime.flat_read_sets != nullptr) {
+				if (runtime.flat_read_sets->size() < flattened.size()) {
+					runtime.flat_read_sets->resize(flattened.size());
+				}
+				(*runtime.flat_read_sets)[read.flat_offset] = flat_deps.reads;
+			}
 		}
+	}
+	if (trace_this) {
+		std::fprintf(stderr, "SrtDeps: reads: user-pair based=%llu other=%llu other_deps=%016llx\n",
+		             static_cast<unsigned long long>(probe.pair_reads),
+		             static_cast<unsigned long long>(probe.other_reads),
+		             static_cast<unsigned long long>(probe.other_deps));
+	}
+	flat_block.End();
+	if (runtime.evaluated_values != nullptr) {
+		*runtime.evaluated_values = evaluated;
+	}
+	if (runtime.evaluated_active != nullptr) {
+		*runtime.evaluated_active = active;
+	}
+	if (runtime.evaluated_flat != nullptr && evaluate_flat) {
+		*runtime.evaluated_flat = flattened;
 	}
 	results = std::move(evaluated);
 	active_sources = std::move(active);
