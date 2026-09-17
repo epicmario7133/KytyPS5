@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/imagePool.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -46,6 +47,7 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	ImagePool&          GetImagePool() { return m_image_pool; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
@@ -69,6 +71,7 @@ private:
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
+	ImagePool                 m_image_pool;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;

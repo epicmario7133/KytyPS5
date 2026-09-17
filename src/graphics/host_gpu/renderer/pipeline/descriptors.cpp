@@ -527,6 +527,34 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto&                texture_cache = m_context.GetTextureCache();
+	const TextureMemoKey key {&resource, value.dwords};
+	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
+		const auto& cached = found->second;
+		const auto* image  = texture_cache.m_slot_images.try_get(cached.image_id);
+		// The image may have been evicted or superseded by an overlapping allocation since.
+		if (image != nullptr &&
+		    (image->info.data.Empty() ||
+		     (image->registered && !image->depth_id && !image->binding.needs_rebind))) {
+			if (cached.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+				texture_cache.MaterializeDccClear(cached.image_id, cached.desc,
+				                                  cached.desc.view_info.base_layer);
+			}
+			return {cached.image_id, nullptr, cached.desc};
+		}
+		m_texture_memo.erase(found);
+	}
+	auto binding = ResolveTextureUncached(resource, value);
+	if (m_texture_memo.size() >= 8192) {
+		m_texture_memo.clear();
+	}
+	m_texture_memo.emplace(key, TextureBinding {binding.image_id, nullptr, binding.desc});
+	return binding;
+}
+
+TextureBinding RenderExecutor::ResolveTextureUncached(
+    const ShaderRecompiler::IR::ImageResource&   resource,
+    const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {

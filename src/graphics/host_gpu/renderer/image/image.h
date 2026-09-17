@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/imagePool.h"
 
 #include <compare>
 #include <limits>
@@ -22,10 +23,6 @@ struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
 
-struct CachedImageView {
-	ImageViewInfo info;
-	vk::ImageView view = nullptr;
-};
 
 struct ImageUsage {
 	bool texture       = false;

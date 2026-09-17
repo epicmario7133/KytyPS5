@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -18,8 +19,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -258,6 +261,20 @@ bool TextureCache::SafeToDownload(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	// KYTY_DEBUG_IMAGE_TRACE=1: log every image creation (sampled after the first 4096).
+	static const bool             image_trace = std::getenv("KYTY_DEBUG_IMAGE_TRACE") != nullptr;
+	static std::atomic<uint64_t>  image_trace_count {0};
+	if (image_trace) {
+		const auto n = image_trace_count.fetch_add(1, std::memory_order_relaxed);
+		if (n < 4096 || (n % 64) == 0) {
+			LOGF("ImageTrace[%" PRIu64 "]: addr=0x%010" PRIx64 " size=0x%" PRIx64
+			     " %ux%ux%u levels=%u layers=%u fmt=%u type=%u tile=%u samples=%u pitch=%u\n",
+			     n, info.data.address, info.data.size, info.extent.width, info.extent.height,
+			     info.extent.depth, info.resources.levels, info.resources.layers,
+			     static_cast<uint32_t>(info.pixel_format), static_cast<uint32_t>(info.type),
+			     static_cast<uint32_t>(info.tile_mode), info.samples, info.pitch);
+		}
+	}
 	m_graphics.reclaim_device_memory = [this](uint64_t bytes) { return ReclaimMemory(bytes); };
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_graphics.reclaim_device_memory = nullptr;
@@ -770,6 +787,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.resources = std::max(requested.resources, cached.info.resources);
 	}
 	info.htile_clear_mask     = 0;
+	static const bool trace_replace = std::getenv("KYTY_DEBUG_IMAGE_TRACE") != nullptr;
+	if (trace_replace) {
+		LOGF("ImageTrace: replace cached addr=0x%010" PRIx64 " %ux%u fmt=%u levels=%u/%u "
+		     "retain=%d requested %ux%u fmt=%u levels=%u\n",
+		     cached.info.data.address, cached.info.extent.width, cached.info.extent.height,
+		     static_cast<uint32_t>(cached.info.pixel_format), cached.info.resources.levels,
+		     cached.info.resources.layers, static_cast<int>(retain_cached_layout),
+		     requested.extent.width, requested.extent.height,
+		     static_cast<uint32_t>(requested.pixel_format), requested.resources.levels);
+	}
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
@@ -906,6 +933,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	static const bool trace_expand = std::getenv("KYTY_DEBUG_IMAGE_TRACE") != nullptr;
+	if (trace_expand) {
+		const auto& source = m_slot_images[source_id];
+		LOGF("ImageTrace: expand addr=0x%010" PRIx64 " %ux%u levels=%u -> %ux%u levels=%u\n",
+		     source.info.data.address, source.info.extent.width, source.info.extent.height,
+		     source.info.resources.levels, info.extent.width, info.extent.height,
+		     info.resources.levels);
+	}
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
@@ -1893,7 +1928,8 @@ bool TextureCache::IsDccMetadataRange(uint64_t address, uint64_t size) {
 	bool             found = false;
 	m_slot_images.ForEach([&](ImageId, const Image& image) {
 		if (!found && image.registered && image.info.metadata.kind == ImageMetadataKind::Dcc &&
-		    image.info.metadata.range.address == address && image.info.metadata.range.size == size) {
+		    address >= image.info.metadata.range.address &&
+		    address + size <= image.info.metadata.range.End()) {
 			found = true;
 		}
 	});
@@ -1965,7 +2001,8 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 bool TextureCache::ReclaimMemory(uint64_t bytes) {
 	// Leave headroom so the next few allocations do not fail again immediately.
 	const uint64_t       target = bytes + 512ull * 1024 * 1024;
-	uint64_t             freed  = 0;
+	uint64_t             freed  = m_scheduler.Context().GetImagePool().Bytes();
+	m_scheduler.Context().GetImagePool().Clear();
 	std::vector<ImageId> candidates;
 	// Images touched during this collection tick are part of the work being recorded.
 	m_lru_cache.ForEachItemBelow(m_gc_tick > 0 ? m_gc_tick - 1 : 0, [&](ImageId id) {
@@ -2017,6 +2054,9 @@ void TextureCache::RunGarbageCollector() {
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		// Past the reported budget the driver is already paging; sweep young images in bulk.
 		const bool     over_budget = aggressive && m_total_used_memory >= m_budget_gc_memory;
+		if (over_budget) {
+			m_scheduler.Context().GetImagePool().Clear();
+		}
 		const uint64_t age       = std::min<uint64_t>(
 		    over_budget ? 8 : aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = over_budget ? 200 : aggressive ? 40 : pressured ? 20 : 10;

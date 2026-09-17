@@ -59,6 +59,11 @@ public:
 		return {bytes, m_slot_images.size()};
 	}
 
+	// Applies a pending native DCC clear of an image bound through desc (public for memoized
+	// texture bindings, which skip the full lookup).
+	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
+
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -68,7 +73,7 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
-	// True when [address, size) is exactly the DCC metadata of a cached image.
+	// True when [address, size) lies within the DCC metadata of a cached image.
 	[[nodiscard]] bool IsDccMetadataRange(uint64_t address, uint64_t size);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
@@ -150,8 +155,7 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
+
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;

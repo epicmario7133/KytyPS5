@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
@@ -685,6 +686,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
+	if (scheduler.Context().GetImagePool().Take(create, backing, views)) {
+		return;
+	}
 	if (!graphics.CreateImage(create, backing)) {
 		// Device memory is full. Let the owning cache evict before giving up: streamed titles
 		// keep more textures resident than a discrete card holds.
@@ -719,6 +723,10 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	if (backing.image != nullptr) {
+		m_scheduler.Context().GetImagePool().Offer(backing, views, AccountedSize());
+		return;
+	}
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <unordered_map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -118,6 +119,9 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Counts handle acquisitions (every recorded command obtains the handle first); lets
+	// barrier emission skip repeats with nothing recorded in between.
+	[[nodiscard]] uint64_t          WorkSerial() const noexcept { return m_work_serial; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -145,6 +149,7 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
+	mutable uint64_t    m_work_serial     = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;
@@ -184,6 +189,30 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding ResolveTextureUncached(
+	    const ShaderRecompiler::IR::ImageResource&   resource,
+	    const ShaderRecompiler::IR::DescriptorValue& value);
+
+	// Resolved texture bindings by (shader resource, descriptor): descriptor decoding, tiling
+	// math and the image lookup dominate draw preparation and repeat identically every draw.
+	struct TextureMemoKey {
+		const ShaderRecompiler::IR::ImageResource* resource = nullptr;
+		std::array<uint32_t, 8>                    dwords {};
+		bool operator==(const TextureMemoKey& other) const {
+			return resource == other.resource && dwords == other.dwords;
+		}
+	};
+	struct TextureMemoKeyHash {
+		size_t operator()(const TextureMemoKey& key) const noexcept {
+			uint64_t hash = reinterpret_cast<uintptr_t>(key.resource);
+			for (const auto dword: key.dwords) {
+				hash = (hash ^ dword) * 0x9E3779B97F4A7C15ull;
+				hash ^= hash >> 29u;
+			}
+			return static_cast<size_t>(hash);
+		}
+	};
+	std::unordered_map<TextureMemoKey, TextureBinding, TextureMemoKeyHash> m_texture_memo;
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
