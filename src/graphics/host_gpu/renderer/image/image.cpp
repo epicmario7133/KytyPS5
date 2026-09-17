@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -686,7 +687,8 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (scheduler.Context().GetImagePool().Take(create, backing, views)) {
+	static const bool pool_disabled = std::getenv("KYTY_NO_IMAGE_POOL") != nullptr;
+	if (!pool_disabled && scheduler.Context().GetImagePool().Take(create, backing, views)) {
 		return;
 	}
 	if (!graphics.CreateImage(create, backing)) {
@@ -723,7 +725,8 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
-	if (backing.image != nullptr) {
+	static const bool pool_disabled = std::getenv("KYTY_NO_IMAGE_POOL") != nullptr;
+	if (backing.image != nullptr && !pool_disabled) {
 		m_scheduler.Context().GetImagePool().Offer(backing, views, AccountedSize());
 		return;
 	}

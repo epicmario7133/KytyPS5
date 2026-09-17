@@ -18,6 +18,7 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -386,10 +387,11 @@ struct PipelineCache::ProgramCache {
 			    memo.valid && memo.shader_base == params.Base() &&
 			    std::equal(memo.user_data.begin(), memo.user_data.end(),
 			               params.user_data.begin(), params.user_data.end());
-			bool memo_hit = false;
+			static const bool memo_disabled = std::getenv("KYTY_NO_SRT_MEMO") != nullptr;
+			bool              memo_hit      = false;
 			{
 				KYTY_PROFILER_BLOCK("Programs::MemoCheck");
-				memo_hit = same_inputs && SrtReadsUnchanged(memo.reads);
+				memo_hit = !memo_disabled && same_inputs && SrtReadsUnchanged(memo.reads);
 			}
 			if (memo_hit) {
 				KYTY_PROFILER_BLOCK("Programs::MemoHit");

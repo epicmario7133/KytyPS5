@@ -237,7 +237,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	// A guest thread that faulted on GPU-written memory only needs the copy to land; the
+	// command processor keeps recording while that thread waits, instead of draining the
+	// queue itself and serializing CPU and GPU work every readback.
+	const bool                                 gpu_thread = GuestGpu::IsGpuThread();
+	uint64_t                                   pending_tick = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> pending_unmark;
+	m_scheduler.Context().GetGpu().SendCommandSync([&, this] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -283,17 +289,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				     buffer.Size(), window_end - window_begin);
 			}
 			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-			for (const auto& [begin, bytes]: prefetched) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+			static const bool async_disabled = std::getenv("KYTY_NO_ASYNC_READBACK") != nullptr;
+			if (gpu_thread || async_disabled) {
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+				for (const auto& [begin, bytes]: prefetched) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+				}
+			} else {
+				m_scheduler.Flush();
+				pending_tick = tick;
+				pending_unmark.emplace_back(window_begin, window_end - window_begin);
+				pending_unmark.insert(pending_unmark.end(), prefetched.begin(), prefetched.end());
+				return;
 			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (pending_tick != 0) {
+		m_scheduler.GetMasterSemaphore().Wait(pending_tick);
+		m_scheduler.WaitPriorityOperations(pending_tick);
+		for (const auto& [begin, bytes]: pending_unmark) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+		}
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

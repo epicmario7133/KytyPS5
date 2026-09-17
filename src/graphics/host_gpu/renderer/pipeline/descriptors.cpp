@@ -29,6 +29,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -528,6 +529,10 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto&                texture_cache = m_context.GetTextureCache();
+	static const bool    memo_disabled = std::getenv("KYTY_NO_TEXTURE_MEMO") != nullptr;
+	if (memo_disabled) {
+		return ResolveTextureUncached(resource, value);
+	}
 	const TextureMemoKey key {&resource, value.dwords};
 	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
 		const auto& cached = found->second;
