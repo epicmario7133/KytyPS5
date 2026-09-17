@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/asyncCopyPool.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -66,6 +67,10 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t ReadbackCount() const noexcept { return m_readback_count; }
 	[[nodiscard]] uint64_t StalePageCount() const noexcept { return m_stale_page_count; }
+	// Waits for the copy workers; called before a submit reads the staging bytes.
+	void JoinAsyncCopies() { m_async_copies.Join(); }
+	// Clears the GPU-modified flag of the pages in the range that hold no pending GPU bytes.
+	void UnmarkPagesWithoutGpuBytes(uint64_t vaddr, uint64_t size);
 	// Bytes held by cached guest buffers and their count.
 	[[nodiscard]] std::pair<uint64_t, size_t> MemoryStats() const {
 		uint64_t bytes = 0;
@@ -133,6 +138,7 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
+	AsyncCopyPool                                     m_async_copies;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

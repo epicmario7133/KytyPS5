@@ -4,6 +4,8 @@
 #include "common/profiler.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -359,6 +361,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
+	m_context.GetBufferCache().JoinAsyncCopies();
 
 	vk::Result result;
 	uint64_t   tick;

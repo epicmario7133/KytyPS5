@@ -312,7 +312,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// so drop the flag. Otherwise the page stays read-protected and the same guest read
 			// faults again at every access (tens of thousands of faults per second on the
 			// command processor for shader headers next to GPU-written data).
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			UnmarkPagesWithoutGpuBytes(window_begin, window_end - window_begin);
 			m_stale_page_count++;
 		}
 		if (is_write) {
@@ -322,12 +322,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (pending_tick != 0) {
 		m_scheduler.GetMasterSemaphore().Wait(pending_tick);
 		m_scheduler.WaitPriorityOperations(pending_tick);
-		for (const auto& [begin, bytes]: pending_unmark) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
+		// The command processor may have recorded new GPU writes into these pages while the
+		// copy was in flight; only pages without pending GPU bytes lose their flag, and the
+		// tracker is touched from the GPU thread like everywhere else.
+		m_scheduler.Context().GetGpu().SendCommandSync([&, this] {
+			for (const auto& [begin, bytes]: pending_unmark) {
+				UnmarkPagesWithoutGpuBytes(begin, bytes);
+			}
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+		});
 	}
 	// KYTY_DEBUG_READBACK_DUMP=<hex>: after a guest thread's readback that faulted at this
 	// address, log 64 dwords from it (rate limited).
@@ -347,6 +352,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				LOGF("ReadbackDump[%" PRIu64 "]: addr=0x%016" PRIx64 "%s\n", count, vaddr,
 				     text.c_str());
 			}
+		}
+	}
+}
+
+void BufferCache::UnmarkPagesWithoutGpuBytes(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	uint64_t   run_begin = begin;
+	for (auto page = begin; page <= end; page += TRACKER_PAGE_SIZE) {
+		const bool keep = page < end && m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+		if (keep || page == end) {
+			if (run_begin < page) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, page - run_begin);
+			}
+			run_begin = page + TRACKER_PAGE_SIZE;
 		}
 	}
 }
@@ -524,12 +544,42 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+// KYTY_DEBUG_WATCH_ADDR=<hex>: log every GPU write binding (storage buffer, copy, fill) that
+// covers this guest address, with the command processor's current operation.
+uint64_t WatchedAddress() {
+	static const uint64_t address = [] {
+		const char* value = std::getenv("KYTY_DEBUG_WATCH_ADDR");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	return address;
+}
+
+void ReportWatchedWrite(const char* what, uint64_t vaddr, uint64_t size) {
+	const auto            watch      = WatchedAddress();
+	static const uint64_t watch_size = [] {
+		const char* value = std::getenv("KYTY_DEBUG_WATCH_SIZE");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 1ull;
+	}();
+	if (watch == 0 || vaddr >= watch + watch_size || watch >= vaddr + size) {
+		return;
+	}
+	static uint64_t count = 0;
+	if ((count++ % 16) == 0) {
+		LOGF("WatchAddr[%" PRIu64 "]: %s vaddr=0x%016" PRIx64 " size=0x%" PRIx64 "\n", count, what,
+		     vaddr, size);
+	}
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	if (is_written) {
+		ReportWatchedWrite(is_texel_buffer ? "written texel/copy buffer" : "written storage buffer",
+		                   vaddr, size);
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
@@ -574,8 +624,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	if (staging == nullptr) {
+		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	}
+	// Large copies run on the copy workers; the scheduler joins them before every submit, and
+	// the staging bytes are only read by the GPU after that.
+	static const bool  async_disabled = std::getenv("KYTY_NO_ASYNC_COPY") != nullptr;
+	constexpr uint64_t AsyncThreshold = 128 * 1024;
+	if (!async_disabled && size >= AsyncThreshold && m_staging_buffer.IsCoherent()) {
+		m_async_copies.Enqueue({vaddr, staging, size});
+	} else if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
@@ -583,6 +642,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	if (!is_gds) {
+		ReportWatchedWrite("fill", vaddr, size);
+	}
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -611,6 +673,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	if (!dst_gds) {
+		ReportWatchedWrite("copy destination", dst_vaddr, size);
+	}
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
