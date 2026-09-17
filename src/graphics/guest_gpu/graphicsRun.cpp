@@ -1145,10 +1145,14 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
 
 	// The CPU copy is only a snapshot; arguments the GPU writes are resolved on the GPU.
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode,
+	// Touching them through the guest mapping would fault and drain the GPU every dispatch.
+	DispatchIndirectArgs args {};
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args))) {
+		args = {};
+	}
+	DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
 	               args_addr);
 }
 

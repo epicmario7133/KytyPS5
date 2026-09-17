@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -250,10 +251,44 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			m_readback_count++;
+			// Refresh the other hot windows in the same drain.
+			std::vector<std::pair<uint64_t, uint64_t>> prefetched;
+			if (!is_write) {
+				for (const auto& [hot_begin, hot_size]: m_hot_readbacks) {
+					if (hot_begin == window_begin || !IsRegionRegistered(hot_begin, hot_size) ||
+					    !m_memory_tracker.IsRegionGpuModified(hot_begin, hot_size)) {
+						continue;
+					}
+					auto&      hot_buffer = m_slot_buffers[FindBuffer(hot_begin, hot_size)];
+					const auto begin      = std::max(hot_begin, hot_buffer.CpuAddress());
+					const auto end        = std::min(hot_begin + hot_size,
+					                                 hot_buffer.CpuAddress() + hot_buffer.Size());
+					if (begin < end && DownloadBufferMemory(hot_buffer, begin, end - begin)) {
+						prefetched.emplace_back(begin, end - begin);
+					}
+				}
+				const std::pair<uint64_t, uint64_t> window {window_begin, window_end - window_begin};
+				std::erase(m_hot_readbacks, window);
+				m_hot_readbacks.insert(m_hot_readbacks.begin(), window);
+				if (m_hot_readbacks.size() > HotReadbackLimit) {
+					m_hot_readbacks.resize(HotReadbackLimit);
+				}
+			}
+			static const bool trace = std::getenv("KYTY_DEBUG_READBACK_TRACE") != nullptr;
+			if (trace && (m_readback_count % 64) == 0) {
+				LOGF("Readback[%" PRIu64 "]: addr=0x%016" PRIx64 " size=0x%" PRIx64 " write=%d "
+				     "buffer=0x%016" PRIx64 "+0x%" PRIx64 " window=0x%" PRIx64 "\n",
+				     m_readback_count, vaddr, size, static_cast<int>(is_write), buffer_begin,
+				     buffer.Size(), window_end - window_begin);
+			}
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			for (const auto& [begin, bytes]: prefetched) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

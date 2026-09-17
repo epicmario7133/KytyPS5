@@ -1342,8 +1342,14 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t mode = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode,
-		                  reinterpret_cast<uint64_t>(args));
+		// GPU-written arguments are resolved on the GPU; reading them here would fault and drain.
+		DispatchIndirectArgs snapshot {};
+		if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(args), &snapshot,
+		                                               sizeof(snapshot))) {
+			snapshot = {};
+		}
+		cp.DispatchDirect(snapshot.thread_group_x, snapshot.thread_group_y,
+		                  snapshot.thread_group_z, mode, reinterpret_cast<uint64_t>(args));
 
 		return 3;
 	}

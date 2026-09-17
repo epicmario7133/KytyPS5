@@ -186,7 +186,13 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		// A DCC clear-key fill is decoded from guest memory when the target is next bound, so
+		// keep it on the host: a GPU fill would force a full drain to read it back every frame.
+		if (!cache.IsDccMetadataRange(descriptor.Base48(), size)) {
+			return false;
+		}
+		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+		return true;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
