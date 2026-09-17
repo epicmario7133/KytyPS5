@@ -585,8 +585,11 @@ static bool TryEmulateSse4a(Context& context) {
 	if (rip[offset] != 0x0f) {
 		return false;
 	}
-	const bool register_extract = prefix == 0x66 && rip[offset + 1] == 0x79;
-	if (rip[offset + 1] != 0x78 && !register_extract) {
+	// 0F 78 is the immediate form; 0F 79 carries length and index in the source register
+	// (EXTRQ: xmm2[5:0] / xmm2[13:8], INSERTQ: xmm2[69:64] / xmm2[77:72]).
+	const bool register_form    = rip[offset + 1] == 0x79;
+	const bool register_extract = prefix == 0x66 && register_form;
+	if (rip[offset + 1] != 0x78 && !register_form) {
 		return false;
 	}
 
@@ -609,15 +612,19 @@ static bool TryEmulateSse4a(Context& context) {
 		return false;
 	}
 	uint64_t dest[2] {};
-	uint64_t source = 0;
+	uint64_t source_words[2] {};
 	std::memcpy(dest, dest_xmm, sizeof(dest));
-	std::memcpy(&source, src_xmm, sizeof(source));
-	uint8_t length             = 0;
-	uint8_t index              = 0;
-	size_t  instruction_length = offset + 3;
+	std::memcpy(source_words, src_xmm, sizeof(source_words));
+	const uint64_t source             = source_words[0];
+	uint8_t        length             = 0;
+	uint8_t        index              = 0;
+	size_t         instruction_length = offset + 3;
 	if (register_extract) {
 		length = static_cast<uint8_t>(source);
 		index  = static_cast<uint8_t>(source >> 8u);
+	} else if (register_form) {
+		length = static_cast<uint8_t>(source_words[1]);
+		index  = static_cast<uint8_t>(source_words[1] >> 8u);
 	} else {
 		length = rip[offset + 3];
 		index  = rip[offset + 4];
