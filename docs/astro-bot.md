@@ -8,8 +8,9 @@ This fork exists for one purpose: getting **Astro Bot** running on KytyPS5. Ever
 - The game boots, plays the intro, reaches the title screen and the main menu, and a new save
   can be started.
 - Rendering is complete (full frame, ray-traced lighting, UI).
-- Still to do: a few materials render incorrectly, and the frame rate is low (roughly 5–30 fps
-  depending on the scene on an RTX 3070 Ti / i7-11700K; see the performance notes below).
+- Still to do: a few materials render incorrectly, and the frame rate is not stable yet
+  (roughly 17–55 fps in the intro on an RTX 3070 Ti / i7-11700K, the crowd and alien close-ups
+  being the slowest; see the performance notes below).
 
 ## What was fixed, in the order it was found
 
@@ -52,23 +53,54 @@ This fork exists for one purpose: getting **Astro Bot** running on KytyPS5. Ever
     compute, then read back on the next bind) and the game's own per-frame readbacks each cost a
     drain; those are now read without faulting, written on the host, and batched respectively.
     Non-mesh `DRAW_INDIRECT` is issued with `vkCmdDrawIndirect` instead of reading the arguments.
+12. **Mesh-shader `DRAW_INDIRECT` on the GPU** — mesh programs read their draw data from a
+    small device buffer (address in push constants); a one-thread compute shader converts the
+    GPU-written arguments into that data plus a `VkDrawMeshTasksIndirectCommandEXT`. Guest
+    threads that read GPU memory now wait for their own copy instead of stalling the command
+    processor.
+13. **Partially resident textures** — the game keeps the mip tails of streamed textures in
+    128 KiB slots and points each T# base at where mip 0 would be, with `min_lod` marking the
+    first resident mip. PS5 stores mip chains smallest-first, so the tail is a *prefix* of the
+    allocation. The cache registered every such texture as a full 5.6 MiB image; the tails of ~40
+    neighbouring slots overlapped each one, every tail the streamer wrote invalidated all of them,
+    and each re-uploaded its whole chain (~800 MiB/s of uploads, 57 ms per frame in the crowd
+    scene). Images now own only the byte span of their resident mips (registration, page
+    tracking, invalidation, discovery and uploads), and a T# that lowers `min_lod` extends the
+    residency and reloads the chain.
+14. **Stale GPU-modified pages** — a page flagged GPU-modified with nothing pending to download
+    never lost its flag on a read fault, so it stayed read-protected and the command processor
+    faulted on the same shader header at every draw (77,000 page faults per second on the GPU
+    thread). The flag is dropped when the download has nothing to fetch.
+15. **Image rebinding** — resolving one image (or a colour target) can replace or expand another
+    one bound earlier in the same draw; the rebind pass now repeats until every binding survives
+    ("texture requires rediscovery before final acquisition").
+16. **SRT walk cost** — memos are keyed on the user-data dwords the walk consumed (not every
+    register), the evaluator's value table no longer spills to a hash map, and small guest reads
+    hit a per-thread mapping cache instead of the address-space lock.
 
 ## Performance notes (2026-09-17)
 
 Measured with Tracy (`--profile`, `tracy-capture` / `tracy-csvexport`) during the intro
 cutscene on the RTX 3070 Ti / i7-11700K:
 
-- The emulator is **CPU-bound on the GPU thread**: it spends ~99% of its time in
-  `CommandProcessor::Process`, the host GPU is not the limit. Making every ray miss
-  (`KYTY_DEBUG_SKIP_BVH=1`) does not change the frame rate.
-- 600–800 draws per frame at ~70 µs of host work each: `RebindImages` (~17 µs per stage),
-  program-cache lookup with SRT materialization (~22 µs), the remaining binding/pipeline work.
-- One mesh-shader `DRAW_INDIRECT` per frame whose arguments are written by a GPU culling pass:
-  reading them costs a full queue drain (10–28 ms per frame in heavy scenes). A GPU-side path
-  needs the mesh workgroup count and the index pointer derived on the GPU (small conversion
-  compute shader + reading the draw data from a buffer instead of push constants).
+- The emulator is **CPU-bound on the GPU thread**; the host GPU is not the limit. Making every
+  ray miss (`KYTY_DEBUG_SKIP_BVH=1`) does not change the frame rate.
+- Scripted 5-minute intro run (start, J×3, screenshots every 30 s): the crowd scene went from
+  5 fps to ~20 fps, the bot close-up from 6 to ~30, the alien close-up from 3 to ~17, and the
+  total frame count over the first 315 s from 7,800 to 9,600. The heavy scenes issue 600–1,100
+  draws and ~100–200 compute dispatches per frame.
+- What remains per frame in the crowd scene (Tracy self time): the SRT walk
+  (`Srt::EvaluateRuntimeSources`, ~9 ms: ~880 walks of ~150 IR instructions and ~50 guest
+  reads each; the memo hits only ~16% because the user data carries per-object constant-buffer
+  V#s), texture re-uploads of textures the game re-streams (~4.5 ms), image create/delete churn
+  from transient render-target aliasing (~2.5 ms), and a long tail of ~1 ms items.
+- The game re-streams the same texture files continuously (~4 Hz per texture in gameplay; only
+  a handful of normal maps during the loading tunnel). The cause is not understood; it also makes
+  the loading tunnel occasionally never finish ("infinite loading"). `IMAGE_GET_LOD` is not used
+  by the game, GPU page faults are zero, and the CPU readbacks are shader headers and constant
+  data rather than a streaming feedback buffer.
 - Blocking waits are reported by `KYTY_DEBUG_MEM_STATS=1` (`drains=` is the number of full
-  queue drains).
+  queue drains, `gpu_faults=` the GPU-thread page faults with `KYTY_DEBUG_FAULT_TRACE=1`).
 
 Two emulator instances on the same machine (for example running the game while a test run is
 in progress) share VRAM and the GPU and make loading look stuck; test one at a time.
@@ -88,6 +120,14 @@ Environment variables (all off by default):
 | `KYTY_DEBUG_MEM_STATS=1` | Periodic line with device memory use, cache population, GPU-thread time split, blocking waits, drains, readbacks. |
 | `KYTY_DEBUG_READBACK_TRACE=1` | Sampled log of the CPU reads that force a GPU drain (address, window). |
 | `KYTY_DEBUG_SKIP_BVH=1` | Every ray query misses (profiling aid; lighting goes flat). |
+| `KYTY_DEBUG_REFRESH_TRACE=1` | Log every guest re-upload of a registered image (address, size, format, why). |
+| `KYTY_DEBUG_TEXTURE_TRACE=1` | Log the residency fields of mipmapped T#s and the residency decision with mip offsets. |
+| `KYTY_DEBUG_FAULT_TRACE=1` | Count guest page faults (and GPU-thread faults) in the `KYTY_DEBUG_MEM_STATS` line. |
+| `KYTY_DEBUG_READBACK_DUMP=<hex>` | Dump 64 dwords after a guest readback that faulted at that address. |
+| `KYTY_DEBUG_SRT_MEMO=1` | Per-shader SRT memo hit/miss statistics with a sample of the user data. |
+| `KYTY_DEBUG_IMAGE_TRACE=1` | Log image creation, replacement and expansion. |
+| `KYTY_NO_RESIDENT_MIPS=1` | Treat every texture as fully resident (previous behaviour). |
+| `KYTY_NO_TEXTURE_MEMO=1`, `KYTY_NO_SRT_MEMO=1`, `KYTY_NO_IMAGE_POOL=1`, `KYTY_NO_BARRIER_COALESCE=1`, `KYTY_NO_FLUSH_LIMIT=1`, `KYTY_NO_ASYNC_READBACK=1` | Kill switches for the individual optimizations. |
 
 Useful CLI switches: `--shader-validation true` (spirv-val), `--shader-log-direction File`
 (RDNA2 disassembly and IR in the printf log), `--graphics-debug-dump true --shader-log-folder DIR`
