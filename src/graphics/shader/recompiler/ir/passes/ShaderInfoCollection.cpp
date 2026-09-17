@@ -123,6 +123,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							return Fail("packed pixel ancillary input has an unsupported live use");
 						case StageInputKind::Layer:
 						case StageInputKind::SampleId:
+						case StageInputKind::HelperInvocation:
 							if (program.stage != ShaderType::Pixel || component != 0u) {
 								return Fail("typed pixel scalar input is invalid");
 							}
@@ -299,6 +300,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					break;
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
+				case StageInputKind::HelperInvocation:
+					AddInput(info, kind, 0, 1, "gl_HelperInvocation");
+					break;
 				case StageInputKind::BaryCoordSmooth:
 				case StageInputKind::BaryCoordSmoothCentroid:
 					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");

@@ -47,6 +47,11 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
+	if (kind == IR::StageInputKind::HelperInvocation) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
+		return Select(state, TypeU32(state), value, ConstantU32(state, 1), ConstantU32(state, 0));
+	}
 	if (kind == IR::StageInputKind::FrontFacing) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
@@ -558,6 +563,14 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitBarrier(EmitterState& state) {
+	// Only workgroup stages can synchronize; a stray s_barrier in a vertex or pixel wave (no
+	// LDS sharing outside the wave) is a no-op, and Vulkan forbids the instruction there.
+	switch (state.program.stage) {
+		case ShaderType::Compute:
+		case ShaderType::TessellationControl:
+		case ShaderType::Mesh: break;
+		default: return;
+	}
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone

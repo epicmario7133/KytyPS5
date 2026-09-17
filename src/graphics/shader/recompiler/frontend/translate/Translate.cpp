@@ -1016,6 +1016,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		auto                 initial_exec  = IR::U1(IR::Value(true));
 		uint32_t             total_threads = 0;
+		if (options.stage == ShaderType::Pixel) {
+			// A pixel wave starts with only covered pixels in EXEC; helper lanes join through
+			// S_WQM when derivatives need them. Host helper invocations must therefore start
+			// inactive, or their (undefined) atomics and side effects leak into the wave.
+			initial_exec = entry_ir.IEqual(builtin(IR::StageInputKind::HelperInvocation),
+			                               IR::U32(IR::Value(0u)));
+		}
 		const auto*          workgroup = ShaderWorkgroupInput(options.stage, options.input_info);
 		if (workgroup != nullptr) {
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
