@@ -231,6 +231,17 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+// A view whose base level lies beyond the descriptor's max_mip addresses mips the game
+// allocated but has not advertised yet (a compute mip-chain writer, for instance); the
+// resource then extends to the view's last level.
+static uint8_t EffectiveMaxMip(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource&               descriptor) {
+	if (resource.r128 || descriptor.BaseLevel() > descriptor.MaxMip()) {
+		return descriptor.LastLevel();
+	}
+	return descriptor.MaxMip();
+}
+
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
                                                 const ShaderTextureResource& descriptor) {
 	const auto tile              = descriptor.TileMode();
@@ -293,7 +304,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
+	const auto max_mip = EffectiveMaxMip(resource, descriptor);
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
 	        ? descriptor.LastLevel()
@@ -530,7 +541,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto last_level   = descriptor.LastLevel();
 	const auto type         = TextureType(descriptor);
 	const bool multisampled = IsMultisampledTexture(type);
-	const auto max_mip      = resource.r128 ? last_level : descriptor.MaxMip();
+	const auto max_mip      = EffectiveMaxMip(resource, descriptor);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	const bool dynamic_storage =
 	    storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
