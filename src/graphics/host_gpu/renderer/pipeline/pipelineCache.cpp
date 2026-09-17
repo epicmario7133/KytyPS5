@@ -136,14 +136,12 @@ struct SrtRecorder {
 };
 
 bool RecordShaderSrtMemory(void* context, uint64_t address, uint32_t* value) {
-	KYTY_PROFILER_BLOCK("Srt::Read");
 	const bool ok = ReadShaderSrtMemory(nullptr, address, value);
 	static_cast<SrtRecorder*>(context)->Add(address, ok ? *value : 0, false, ok);
 	return ok;
 }
 
 bool RecordShaderGuestMemory(void* context, uint64_t address, uint32_t* value) {
-	KYTY_PROFILER_BLOCK("Srt::ReadClean");
 	const bool ok = ReadShaderGuestMemory(nullptr, address, value);
 	static_cast<SrtRecorder*>(context)->Add(address, ok ? *value : 0, true, ok);
 	return ok;
@@ -416,6 +414,34 @@ struct PipelineCache::ProgramCache {
 				           memo->second.shader_base == params.Base() &&
 				           SameMaskedUserData(memo->second.user_data, params.user_data, mask) &&
 				           SrtReadsUnchanged(memo->second.reads);
+			}
+			// KYTY_DEBUG_SRT_MEMO=1: per-shader memo statistics every 65536 lookups.
+			static const bool memo_stats = std::getenv("KYTY_DEBUG_SRT_MEMO") != nullptr;
+			if (memo_stats) {
+				struct Stat {
+					uint64_t hits = 0, misses = 0;
+				};
+				static std::unordered_map<uint64_t, Stat> stats;
+				static uint64_t                           lookups = 0;
+				auto& stat = stats[params.hash];
+				(memo_hit ? stat.hits : stat.misses)++;
+				if ((++lookups % 65536) == 0) {
+					std::vector<std::pair<uint64_t, Stat>> sorted(stats.begin(), stats.end());
+					std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+						return a.second.misses > b.second.misses;
+					});
+					for (size_t i = 0; i < std::min<size_t>(sorted.size(), 12); i++) {
+						LOGF("SrtMemo: shader=0x%016" PRIx64 " hits=%" PRIu64 " misses=%" PRIu64 "\n",
+						     sorted[i].first, sorted[i].second.hits, sorted[i].second.misses);
+					}
+					LOGF("SrtMemo: this shader=0x%016" PRIx64 " mask=0x%" PRIx64 " memos=%zu user_data=%zu\n",
+					     params.hash, mask, memos.size(), params.user_data.size());
+					std::string words;
+					for (size_t i = 0; i < params.user_data.size(); i++) {
+						words += fmt::format(" {}{:08x}", UserDataInMask(mask, i) ? "*" : "", params.user_data[i]);
+					}
+					LOGF("SrtMemo: user data:%s\n", words.c_str());
+				}
 			}
 			if (memo_hit) {
 				KYTY_PROFILER_BLOCK("Programs::MemoHit");

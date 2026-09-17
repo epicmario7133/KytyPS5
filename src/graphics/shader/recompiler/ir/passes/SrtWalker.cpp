@@ -469,57 +469,111 @@ private:
 
 // Evaluated-value cache: an inline open-addressing table keyed by instruction pointer. The
 // evaluator runs for every draw, and a heap hash map per walk was most of its cost.
+// Open-addressing table of evaluated instruction values. Entries are stamped with a
+// generation so a fresh walk only bumps the counter instead of clearing the arrays; an
+// entry whose evaluation is in progress is marked pending, which doubles as the cycle check.
 class ValueCache {
 public:
-	ValueCache() { std::memset(m_keys.data(), 0, sizeof(m_keys)); }
+	enum class State : uint8_t { Missing, Pending, Done };
 
-	bool Find(const Inst* key, uint64_t& value) const {
-		for (auto slot = Slot(key); m_keys[slot] != nullptr; slot = (slot + 1u) & (Size - 1u)) {
-			if (m_keys[slot] == key) {
-				value = m_values[slot];
-				return true;
-			}
+	ValueCache() { Reset(); }
+
+	void Reset() {
+		if (++m_generation == 0) {
+			m_stamps.fill(0);
+			m_generation = 1;
 		}
-		return m_spill != nullptr && Spilled(key, value);
+		m_count = 0;
+		if (m_spill != nullptr) {
+			m_spill->clear();
+		}
 	}
 
-	void Insert(const Inst* key, uint64_t value) {
-		if (m_count >= Size / 2u) {
-			if (m_spill == nullptr) {
-				m_spill = std::make_unique<std::unordered_map<const Inst*, uint64_t>>();
+	State Find(const Inst* key, uint64_t& value) const {
+		for (auto slot = Slot(key); m_stamps[slot] == m_generation;
+		     slot = (slot + 1u) & (Size - 1u)) {
+			if (m_keys[slot] == key) {
+				if (m_pending[slot]) {
+					return State::Pending;
+				}
+				value = m_values[slot];
+				return State::Done;
 			}
-			m_spill->emplace(key, value);
-			return;
 		}
-		auto slot = Slot(key);
-		while (m_keys[slot] != nullptr) {
-			slot = (slot + 1u) & (Size - 1u);
+		if (m_spill != nullptr) {
+			if (const auto found = m_spill->find(key); found != m_spill->end()) {
+				if (found->second.second) {
+					return State::Pending;
+				}
+				value = found->second.first;
+				return State::Done;
+			}
 		}
-		m_keys[slot]   = key;
-		m_values[slot] = value;
-		m_count++;
+		return State::Missing;
+	}
+
+	void MarkPending(const Inst* key) { Store(key, 0, true); }
+
+	// Replaces the pending entry the evaluation started with, or drops it on failure.
+	void Complete(const Inst* key, uint64_t value, bool evaluated) {
+		for (auto slot = Slot(key); m_stamps[slot] == m_generation;
+		     slot = (slot + 1u) & (Size - 1u)) {
+			if (m_keys[slot] == key) {
+				if (evaluated) {
+					m_values[slot]  = value;
+					m_pending[slot] = false;
+				} else {
+					// Leave the key in the probe chain but make it unfindable.
+					m_keys[slot] = nullptr;
+				}
+				return;
+			}
+		}
+		if (m_spill != nullptr) {
+			if (evaluated) {
+				(*m_spill)[key] = {value, false};
+			} else {
+				m_spill->erase(key);
+			}
+		}
 	}
 
 private:
-	static constexpr size_t Size = 256;
+	static constexpr size_t Size = 1024;
 
 	static size_t Slot(const Inst* key) {
 		const auto bits = reinterpret_cast<uintptr_t>(key) >> 4u;
 		return static_cast<size_t>((bits ^ (bits >> 13u)) * 0x9E3779B1u) & (Size - 1u);
 	}
-	bool Spilled(const Inst* key, uint64_t& value) const {
-		const auto found = m_spill->find(key);
-		if (found == m_spill->end()) {
-			return false;
+
+	void Store(const Inst* key, uint64_t value, bool pending) {
+		if (m_count >= Size / 2u) {
+			if (m_spill == nullptr) {
+				m_spill = std::make_unique<
+				    std::unordered_map<const Inst*, std::pair<uint64_t, bool>>>();
+			}
+			(*m_spill)[key] = {value, pending};
+			return;
 		}
-		value = found->second;
-		return true;
+		auto slot = Slot(key);
+		while (m_stamps[slot] == m_generation) {
+			slot = (slot + 1u) & (Size - 1u);
+		}
+		m_stamps[slot]  = m_generation;
+		m_keys[slot]    = key;
+		m_values[slot]  = value;
+		m_pending[slot] = pending;
+		m_count++;
 	}
 
-	std::array<const Inst*, Size>                                m_keys {};
-	std::array<uint64_t, Size>                                   m_values {};
-	size_t                                                       m_count = 0;
-	std::unique_ptr<std::unordered_map<const Inst*, uint64_t>> m_spill;
+	// Only the stamps need clearing; the other arrays are valid wherever a stamp matches.
+	std::array<const Inst*, Size> m_keys;
+	std::array<uint64_t, Size>    m_values;
+	std::array<uint32_t, Size>    m_stamps {};
+	std::array<bool, Size>        m_pending;
+	uint32_t                      m_generation = 0;
+	size_t                        m_count      = 0;
+	std::unique_ptr<std::unordered_map<const Inst*, std::pair<uint64_t, bool>>> m_spill;
 };
 
 class Evaluator {
@@ -567,18 +621,19 @@ private:
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (m_cache.Find(inst, result)) {
-			return true;
+		switch (m_cache.Find(inst, result)) {
+			case ValueCache::State::Done: return true;
+			case ValueCache::State::Pending: return false; // cycle
+			case ValueCache::State::Missing: break;
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
-			return false;
-		}
-		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		m_cache.MarkPending(inst);
+		m_depth++;
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
-		m_visiting.pop_back();
+		m_depth--;
+		m_cache.Complete(inst, out, evaluated);
 		if (!evaluated) {
-			if (m_visiting.empty()) {
+			if (m_depth == 0) {
 				std::fprintf(stderr, "shader SRT evaluation: hash=0x%016llx cannot evaluate %.*s\n",
 				             static_cast<unsigned long long>(m_program.shader_hash),
 				             static_cast<int>(ValueOpcodeName(inst->GetOpcode()).size()),
@@ -586,7 +641,6 @@ private:
 			}
 			return false;
 		}
-		m_cache.Insert(inst, out);
 		result = out;
 		return true;
 	}
@@ -1041,7 +1095,7 @@ private:
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
 	ValueCache                                m_cache;
-	std::vector<const Inst*>                  m_visiting;
+	uint32_t                                  m_depth = 0;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
