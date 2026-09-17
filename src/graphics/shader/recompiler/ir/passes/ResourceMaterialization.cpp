@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -288,9 +289,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	std::vector<DescriptorValue> values;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint8_t>         active_sources;
-	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots, active_sources)) {
-		return false;
+	{
+		KYTY_PROFILER_BLOCK("Srt::EvaluateRuntimeSources");
+		if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
+		                            flattened_srt, program.clean_flat_slots, active_sources)) {
+			return false;
+		}
 	}
 
 	auto&                   next  = snapshot.resources;
@@ -323,12 +327,16 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			SrtRuntime       clean_runtime = runtime;
 			clean_runtime.read_memory      = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
-			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
-				return false;
+			{
+				KYTY_PROFILER_BLOCK("Srt::IndirectTables");
+				if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
+					return false;
+				}
 			}
 			const auto&   material = tables[0];
 			const auto&   heap     = tables[1];
 			IndirectImage table;
+			KYTY_PROFILER_BLOCK("Srt::IndirectImage");
 			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, image.r128,
 			                              runtime, table)) {
 				return false;
@@ -962,6 +970,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;
 	}
+	KYTY_PROFILER_BLOCK("Srt::BuildSpecialization");
 	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization);
 }
 

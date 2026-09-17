@@ -110,6 +110,56 @@ bool ReadShaderSrtMemory(void*, uint64_t address, uint32_t* value) {
 	return true;
 }
 
+// Memory the SRT walk touched while materializing a snapshot. The next draw with the same
+// user data replays these reads; if nothing changed the previous snapshot is reused instead of
+// walking the descriptor chains again.
+struct SrtRead {
+	uint64_t address = 0;
+	uint32_t value   = 0;
+	bool     clean   = false; // read through the GPU-clean reader
+	bool     ok      = false;
+};
+
+struct SrtRecorder {
+	std::vector<SrtRead> reads;
+	bool                 overflow = false;
+	static constexpr size_t Limit = 2048;
+
+	void Add(uint64_t address, uint32_t value, bool clean, bool ok) {
+		if (reads.size() >= Limit) {
+			overflow = true;
+			return;
+		}
+		reads.push_back({address, value, clean, ok});
+	}
+};
+
+bool RecordShaderSrtMemory(void* context, uint64_t address, uint32_t* value) {
+	KYTY_PROFILER_BLOCK("Srt::Read");
+	const bool ok = ReadShaderSrtMemory(nullptr, address, value);
+	static_cast<SrtRecorder*>(context)->Add(address, ok ? *value : 0, false, ok);
+	return ok;
+}
+
+bool RecordShaderGuestMemory(void* context, uint64_t address, uint32_t* value) {
+	KYTY_PROFILER_BLOCK("Srt::ReadClean");
+	const bool ok = ReadShaderGuestMemory(nullptr, address, value);
+	static_cast<SrtRecorder*>(context)->Add(address, ok ? *value : 0, true, ok);
+	return ok;
+}
+
+bool SrtReadsUnchanged(const std::vector<SrtRead>& reads) {
+	for (const auto& read: reads) {
+		uint32_t   value = 0;
+		const bool ok    = read.clean ? ReadShaderGuestMemory(nullptr, read.address, &value)
+		                              : ReadShaderSrtMemory(nullptr, read.address, &value);
+		if (ok != read.ok || (ok && value != read.value)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -207,6 +257,15 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
+	struct SnapshotMemo {
+		bool                                         valid = false;
+		uint64_t                                     shader_base = 0;
+		std::vector<uint32_t>                        user_data;
+		std::vector<SrtRead>                         reads;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+	};
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
@@ -215,7 +274,20 @@ struct PipelineCache::ProgramCache {
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+		// Snapshots by user-data content: the same objects are drawn every frame with the same
+		// SRT pointers, so most draws replay a previous walk.
+		static constexpr size_t                   MemoLimit = 512;
+		std::unordered_map<uint64_t, SnapshotMemo> memos;
 	};
+
+	static uint64_t HashUserData(uint64_t shader_base, std::span<const uint32_t> user_data) {
+		uint64_t hash = shader_base * 0x9E3779B97F4A7C15ull;
+		for (const auto word: user_data) {
+			hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+			hash ^= hash >> 31u;
+		}
+		return hash;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -287,12 +359,14 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		Profiler::ScopedBlock lookup_block(KYTY_PROFILER_SOURCE("Programs::Lookup"));
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		lookup_block.End();
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -302,8 +376,44 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			auto&      memos    = entry->second.memos;
+			const auto memo_key = HashUserData(params.Base(), params.user_data);
+			if (memos.size() >= SourceEntry::MemoLimit) {
+				memos.clear();
+			}
+			auto&      memo = memos[memo_key];
+			const bool same_inputs =
+			    memo.valid && memo.shader_base == params.Base() &&
+			    std::equal(memo.user_data.begin(), memo.user_data.end(),
+			               params.user_data.begin(), params.user_data.end());
+			bool memo_hit = false;
+			{
+				KYTY_PROFILER_BLOCK("Programs::MemoCheck");
+				memo_hit = same_inputs && SrtReadsUnchanged(memo.reads);
+			}
+			if (memo_hit) {
+				KYTY_PROFILER_BLOCK("Programs::MemoHit");
+				resources      = memo.resources;
+				specialization = memo.specialization;
+			} else {
+				KYTY_PROFILER_BLOCK("Programs::Materialize");
+				SrtRecorder recorder;
+				auto        recording_runtime                       = runtime;
+				recording_runtime.userdata                          = &recorder;
+				recording_runtime.read_memory                       = RecordShaderSrtMemory;
+				recording_runtime.read_specialization_memory        = RecordShaderGuestMemory;
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, recording_runtime, resources, specialization));
+				memo.valid = !recorder.overflow;
+				if (memo.valid) {
+					memo.shader_base = params.Base();
+					memo.user_data.assign(params.user_data.begin(), params.user_data.end());
+					memo.reads          = std::move(recorder.reads);
+					memo.resources      = resources;
+					memo.specialization = specialization;
+				}
+			}
+			KYTY_PROFILER_BLOCK("Programs::Permutation");
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;

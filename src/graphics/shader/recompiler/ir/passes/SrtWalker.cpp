@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <memory>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -465,6 +467,61 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+// Evaluated-value cache: an inline open-addressing table keyed by instruction pointer. The
+// evaluator runs for every draw, and a heap hash map per walk was most of its cost.
+class ValueCache {
+public:
+	ValueCache() { std::memset(m_keys.data(), 0, sizeof(m_keys)); }
+
+	bool Find(const Inst* key, uint64_t& value) const {
+		for (auto slot = Slot(key); m_keys[slot] != nullptr; slot = (slot + 1u) & (Size - 1u)) {
+			if (m_keys[slot] == key) {
+				value = m_values[slot];
+				return true;
+			}
+		}
+		return m_spill != nullptr && Spilled(key, value);
+	}
+
+	void Insert(const Inst* key, uint64_t value) {
+		if (m_count >= Size / 2u) {
+			if (m_spill == nullptr) {
+				m_spill = std::make_unique<std::unordered_map<const Inst*, uint64_t>>();
+			}
+			m_spill->emplace(key, value);
+			return;
+		}
+		auto slot = Slot(key);
+		while (m_keys[slot] != nullptr) {
+			slot = (slot + 1u) & (Size - 1u);
+		}
+		m_keys[slot]   = key;
+		m_values[slot] = value;
+		m_count++;
+	}
+
+private:
+	static constexpr size_t Size = 256;
+
+	static size_t Slot(const Inst* key) {
+		const auto bits = reinterpret_cast<uintptr_t>(key) >> 4u;
+		return static_cast<size_t>((bits ^ (bits >> 13u)) * 0x9E3779B1u) & (Size - 1u);
+	}
+	bool Spilled(const Inst* key, uint64_t& value) const {
+		const auto found = m_spill->find(key);
+		if (found == m_spill->end()) {
+			return false;
+		}
+		value = found->second;
+		return true;
+	}
+
+	std::array<const Inst*, Size>                                m_keys {};
+	std::array<uint64_t, Size>                                   m_values {};
+	size_t                                                       m_count = 0;
+	std::unique_ptr<std::unordered_map<const Inst*, uint64_t>> m_spill;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -506,17 +563,11 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
-			m_reserved = true;
-		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		if (m_cache.Find(inst, result)) {
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
@@ -535,7 +586,7 @@ private:
 			}
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		m_cache.Insert(inst, out);
 		result = out;
 		return true;
 	}
@@ -985,9 +1036,8 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	ValueCache                                m_cache;
 	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
