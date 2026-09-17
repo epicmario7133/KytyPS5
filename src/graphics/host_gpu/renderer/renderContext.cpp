@@ -64,6 +64,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// KYTY_DEBUG_FAULT_TRACE=1: count guest page faults; log the GPU thread's read faults.
+	static const bool fault_trace = std::getenv("KYTY_DEBUG_FAULT_TRACE") != nullptr;
+	if (fault_trace) {
+		const bool gpu_thread = GuestGpu::IsGpuThread();
+		m_fault_count.fetch_add(1, std::memory_order_relaxed);
+		if (gpu_thread) {
+			const auto n = m_gpu_fault_count.fetch_add(1, std::memory_order_relaxed);
+			if (n < 256 || (n % 4096) == 0) {
+				LOGF("FaultTrace[%" PRIu64 "]: gpu-thread %s fault at 0x%016" PRIx64 "\n", n,
+				     access == PageFaultAccess::Write ? "write" : "read", fault_vaddr);
+			}
+		}
+	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -148,13 +161,15 @@ void RenderContext::RunGarbageCollector() {
 		LOGF("MemStats: frame=%d device=%" PRIu64 " MiB budget=%" PRIu64 " MiB images=%zu (%" PRIu64
 		     " MiB) buffers=%zu (%" PRIu64 " MiB) ticks=%" PRIu64 " waits=%" PRIu64 " (%" PRIu64
 		     " ms) drains=%" PRIu64 " stream_waits=%" PRIu64 " readbacks=%" PRIu64
-		     " downloads=%" PRIu64 "\n",
+		     " downloads=%" PRIu64 " faults=%" PRIu64 " gpu_faults=%" PRIu64
+		     " stale_pages=%" PRIu64 "\n",
 		     m_gpu != nullptr ? m_gpu->GetFrameNum() : -1, m_graphics.GetDeviceMemoryUsage() >> 20,
 		     m_graphics.GetTotalMemoryBudget() >> 20, image_count, image_bytes >> 20, buffer_count,
 		     buffer_bytes >> 20, m_command_scheduler.CurrentTick(), master.BlockingWaits(),
 		     master.BlockingWaitNanoseconds() / 1000000, m_command_scheduler.DrainCount(),
 		     m_command_scheduler.StreamWaitCount(), m_buffer_cache.ReadbackCount(),
-		     m_texture_cache.DownloadCount());
+		     m_texture_cache.DownloadCount(), m_fault_count.load(std::memory_order_relaxed),
+		     m_gpu_fault_count.load(std::memory_order_relaxed), m_buffer_cache.StalePageCount());
 		if (m_gpu != nullptr) {
 			const auto stats = m_gpu->GetThreadStats();
 			LOGF("GpuThread: idle=%" PRIu64 " ms blocked=%" PRIu64 " ms (%" PRIu64

@@ -291,6 +291,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			const auto tick = m_scheduler.CurrentTick();
 			static const bool async_disabled = std::getenv("KYTY_NO_ASYNC_READBACK") != nullptr;
 			if (gpu_thread || async_disabled) {
+				KYTY_PROFILER_BLOCK("Wait::Readback");
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
 				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -304,6 +305,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				pending_unmark.insert(pending_unmark.end(), prefetched.begin(), prefetched.end());
 				return;
 			}
+		} else if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+			// The page is flagged GPU-modified but holds no pending GPU bytes: nothing to fetch,
+			// so drop the flag. Otherwise the page stays read-protected and the same guest read
+			// faults again at every access (tens of thousands of faults per second on the
+			// command processor for shader headers next to GPU-written data).
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			m_stale_page_count++;
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -677,8 +685,11 @@ void BufferCache::RunGarbageCollector() {
 
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(completion_tick);
-	m_scheduler.WaitPriorityOperations(completion_tick);
+	{
+		KYTY_PROFILER_BLOCK("Wait::BufferGc");
+		m_scheduler.Wait(completion_tick);
+		m_scheduler.WaitPriorityOperations(completion_tick);
+	}
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
 		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());

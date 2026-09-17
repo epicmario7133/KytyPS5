@@ -65,6 +65,7 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] uint64_t ReadbackCount() const noexcept { return m_readback_count; }
+	[[nodiscard]] uint64_t StalePageCount() const noexcept { return m_stale_page_count; }
 	// Bytes held by cached guest buffers and their count.
 	[[nodiscard]] std::pair<uint64_t, size_t> MemoryStats() const {
 		uint64_t bytes = 0;
@@ -137,6 +138,7 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_stale_page_count   = 0;
 	uint64_t                                          m_readback_count     = 0;
 	// Windows the CPU recently read back after a GPU write. A title that polls several GPU
 	// results per frame (exposure, visibility, indirect counts) otherwise drains the queue once

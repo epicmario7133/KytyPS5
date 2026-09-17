@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "gpu_tiler_shaders/mesh_indirect_args_spv.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -48,6 +49,7 @@ MeshIndirect::~MeshIndirect() {
 MeshIndirect::Slot MeshIndirect::Allocate() {
 	if (m_cursor + SlotBytes > ScratchBytes) {
 		// The previous lap must be consumed before its slots are overwritten.
+		KYTY_PROFILER_BLOCK("Wait::MeshIndirectWrap");
 		m_scheduler.Wait(m_wrap_tick);
 		m_cursor    = 0;
 		m_wrap_tick = m_scheduler.CurrentTick();

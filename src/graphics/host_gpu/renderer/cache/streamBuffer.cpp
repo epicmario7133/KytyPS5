@@ -323,7 +323,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 			return false;
 		}
 		Scheduler().CountStreamWait();
-		Scheduler().Wait(watch.tick);
+		{
+			KYTY_PROFILER_BLOCK("Wait::StreamBuffer");
+			Scheduler().Wait(watch.tick);
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}
