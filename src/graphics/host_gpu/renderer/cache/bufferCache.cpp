@@ -14,6 +14,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <fmt/format.h>
+#include <string>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -325,6 +327,26 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	}
+	// KYTY_DEBUG_READBACK_DUMP=<hex>: after a guest thread's readback that faulted at this
+	// address, log 64 dwords from it (rate limited).
+	static const uint64_t dump_address = [] {
+		const char* value = std::getenv("KYTY_DEBUG_READBACK_DUMP");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	if (dump_address != 0 && pending_tick != 0 && vaddr == dump_address) {
+		static uint64_t count = 0;
+		if ((count++ % 16) == 0) {
+			uint32_t words[64] {};
+			if (LibKernel::Memory::TryReadBacking(vaddr, words, sizeof(words))) {
+				std::string text;
+				for (const auto word: words) {
+					text += fmt::format(" {:08x}", word);
+				}
+				LOGF("ReadbackDump[%" PRIu64 "]: addr=0x%016" PRIx64 "%s\n", count, vaddr,
+				     text.c_str());
+			}
 		}
 	}
 }

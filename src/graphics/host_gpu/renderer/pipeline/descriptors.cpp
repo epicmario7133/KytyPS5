@@ -453,22 +453,46 @@ static void SetResidentLevel(ImageInfo& info, uint32_t min_level) {
 	    info.resources.levels > info.mip_layout.size()) {
 		return;
 	}
-	const auto level  = std::min(min_level, info.resources.levels - 1u);
-	uint64_t   offset = UINT64_MAX;
+	const auto level = std::min(min_level, info.resources.levels - 1u);
+	uint64_t   begin = UINT64_MAX;
+	uint64_t   end   = 0;
 	for (uint32_t mip = level; mip < info.resources.levels; mip++) {
-		offset = std::min(offset, info.mip_layout[mip].offset);
+		const auto& layout = info.mip_layout[mip];
+		if (layout.size == 0) {
+			return;
+		}
+		begin = std::min(begin, layout.offset);
+		end   = std::max(end, layout.offset + layout.size);
 	}
-	if (offset == 0 || offset >= info.data.size) {
+	if (begin >= end || end > info.data.size || (begin == 0 && end == info.data.size)) {
 		return;
 	}
 	for (uint32_t mip = 0; mip < level; mip++) {
-		// A layout that keeps a lower mip past the resident cut is not sliceable.
-		if (info.mip_layout[mip].offset >= offset) {
+		// A non-resident mip inside the resident span makes the chain unsliceable.
+		const auto& layout = info.mip_layout[mip];
+		if (layout.offset < end && begin < layout.offset + layout.size) {
 			return;
 		}
 	}
 	info.resident_level  = level;
-	info.resident_offset = offset;
+	info.resident_offset = begin;
+	info.resident_size   = end - begin;
+}
+
+static void TraceResidency(const ImageInfo& info, uint32_t min_level) {
+	static const bool trace = std::getenv("KYTY_DEBUG_TEXTURE_TRACE") != nullptr;
+	if (!trace || min_level == 0 || info.resources.levels <= 1) {
+		return;
+	}
+	std::string offsets;
+	for (uint32_t mip = 0; mip < std::min<uint32_t>(info.resources.levels, 16u); mip++) {
+		offsets += fmt::format(" {:#x}", info.mip_layout[mip].offset);
+	}
+	LOGF("ResidencyTrace: addr=0x%010" PRIx64 " size=0x%" PRIx64 " levels=%u layers=%u meta=%u "
+	     "min_level=%u -> resident=%u@0x%" PRIx64 "+0x%" PRIx64 " offsets:%s\n",
+	     info.data.address, info.data.size, info.resources.levels, info.resources.layers,
+	     static_cast<uint32_t>(info.metadata.kind), min_level, info.resident_level,
+	     info.resident_offset, info.resident_size, offsets.c_str());
 }
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
@@ -738,6 +762,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	} else {
 		PopulateTextureMipLayout(desc.info);
 		SetResidentLevel(desc.info, descriptor.MinLod() >> 8u);
+		TraceResidency(desc.info, descriptor.MinLod() >> 8u);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);

@@ -68,14 +68,19 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
-	// First mip backed by guest memory (T# min_lod): the bytes of the mips before it belong
-	// to other allocations and are neither tracked nor uploaded.
+	// First mip backed by guest memory (T# min_lod) and the byte span its resident mips
+	// occupy (PS5 stores mip chains smallest-first, so this is usually a prefix). The bytes
+	// of the other mips belong to other allocations and are neither tracked nor uploaded.
+	// resident_size == 0 means the whole allocation.
 	uint32_t                     resident_level  = 0;
 	uint64_t                     resident_offset = 0;
+	uint64_t                     resident_size   = 0;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
+	[[nodiscard]] constexpr bool PartiallyResident() const noexcept { return resident_size != 0; }
 	[[nodiscard]] constexpr GuestRange ResidentRange() const noexcept {
-		return {data.address + resident_offset, data.size - resident_offset};
+		return PartiallyResident() ? GuestRange {data.address + resident_offset, resident_size}
+		                           : data;
 	}
 
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }

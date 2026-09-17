@@ -1093,12 +1093,13 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		const auto resident_size = info.data.size - info.resident_offset;
-		if (info.resident_offset != 0) {
-			// The source holds the resident range only; drop the mips before it.
+		const auto resident_size = info.ResidentRange().size;
+		if (info.PartiallyResident()) {
+			// The source holds the resident span only; drop the other mips.
 			if (!transfer.tiles.empty() && transfer.tiles.size() != transfer.regions.size()) {
 				EXIT("TextureCache: resident upload needs one tile per region\n");
 			}
+			const auto resident_end = info.resident_offset + resident_size;
 			std::vector<vk::BufferImageCopy> regions;
 			std::vector<GpuTileInfo>         tiles;
 			for (size_t index = 0; index < transfer.regions.size(); index++) {
@@ -1108,15 +1109,16 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 				}
 				if (transfer.tiles.empty()) {
 					auto copy = region;
-					if (copy.bufferOffset < info.resident_offset) {
-						EXIT("TextureCache: resident mip precedes the resident offset\n");
+					if (copy.bufferOffset < info.resident_offset || copy.bufferOffset >= resident_end) {
+						EXIT("TextureCache: resident mip lies outside the resident span\n");
 					}
 					copy.bufferOffset -= info.resident_offset;
 					regions.push_back(copy);
 				} else {
 					auto tile = transfer.tiles[index];
-					if (tile.tiled_offset < info.resident_offset) {
-						EXIT("TextureCache: resident tile precedes the resident offset\n");
+					if (tile.tiled_offset < info.resident_offset ||
+					    tile.tiled_offset + tile.tiled_size > resident_end) {
+						EXIT("TextureCache: resident tile lies outside the resident span\n");
 					}
 					tile.tiled_offset -= info.resident_offset;
 					tiles.push_back(tile);
@@ -1304,14 +1306,15 @@ void TextureCache::RefreshImage(ImageId id) {
 	static const bool trace_refresh = std::getenv("KYTY_DEBUG_REFRESH_TRACE") != nullptr;
 	if (trace_refresh) {
 		LOGF("RefreshTrace: gc=%" PRIu64 " addr=0x%010" PRIx64 " size=0x%" PRIx64 " %ux%ux%u fmt=%u "
-		     "levels=%u tile=%u buffer=%d cpu=%d gpu=%d\n",
+		     "levels=%u tile=%u buffer=%d cpu=%d gpu=%d resident=%u+0x%" PRIx64 "\n",
 		     m_gc_tick, image.info.data.address,
 		     image.info.data.size, image.info.extent.width, image.info.extent.height,
 		     image.info.extent.depth, static_cast<uint32_t>(image.info.pixel_format),
 		     image.info.resources.levels, static_cast<uint32_t>(image.info.tile_mode),
 		     static_cast<int>(image.IsBufferModified()),
 		     static_cast<int>(image.IsDefinitelyCpuDirty()),
-		     static_cast<int>(image.IsGpuModified()));
+		     static_cast<int>(image.IsGpuModified()), image.info.resident_level,
+		     image.info.ResidentRange().address - image.info.data.address);
 	}
 	KYTY_PROFILER_BLOCK("Texture::RefreshUpload");
 	InitializeImage(id);
@@ -1370,7 +1373,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 			}
 		}
-		if (result && desc.info.resident_offset < m_slot_images[result].info.resident_offset) {
+		if (result && desc.info.resident_level < m_slot_images[result].info.resident_level) {
 			ExtendResidency(result, desc.info);
 		}
 
@@ -1441,6 +1444,7 @@ void TextureCache::ExtendResidency(ImageId id, const ImageInfo& requested) {
 	UnregisterImage(id);
 	image.info.resident_level  = requested.resident_level;
 	image.info.resident_offset = requested.resident_offset;
+	image.info.resident_size   = requested.resident_size;
 	RegisterImage(id);
 	const auto resident = image.info.ResidentRange();
 	image.InvalidateCpuWrite(resident.address, resident.size);
@@ -1897,7 +1901,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	// A partially resident chain cannot be written back: the bytes before its resident mip
 	// belong to other allocations.
-	if (image.depth_id || image.info.resident_offset != 0) {
+	if (image.depth_id || image.info.PartiallyResident()) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
