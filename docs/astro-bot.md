@@ -77,6 +77,24 @@ This fork exists for one purpose: getting **Astro Bot** running on KytyPS5. Ever
 16. **SRT walk cost** — memos are keyed on the user-data dwords the walk consumed (not every
     register), the evaluator's value table no longer spills to a hash map, and small guest reads
     hit a per-thread mapping cache instead of the address-space lock.
+17. **Per-resource SRT memo** — the game allocates each draw's SRT struct from a ring, so
+    memos keyed on user data never hit for the shaders that read their descriptor tables through
+    that pointer. The evaluator now tracks which user-data dwords and which recorded reads every
+    value depends on; reads addressed as "pointer + offset" (pointer from user data or from two
+    earlier reads) are recorded relocatable and replayed at the current pointer, and only reads
+    whose value reached a result have to match. Results that depend on memory alone (descriptor
+    tables, flat constant slots, the control-flow decision) are copied into the walk when their
+    reads still hold; per-draw descriptors are evaluated as before. Crowd scene ~20 → ~29 fps.
+18. **Staging copies off the command processor** — uploads of 128 KiB and more are copied into
+    the staging buffer by two worker threads; the scheduler joins them before each submit.
+19. **Texture eviction ages** — the collector runs ~8 times per frame and its "pressured" tier
+    is the normal state on an 8 GiB card; it evicted images unused for 10 frames (1 frame when
+    over budget), which turned a tight VRAM budget into a re-upload storm. Ages are now 40 / 12 /
+    4 frames.
+20. **Readback race** — the asynchronous readback cleared a whole window's GPU-modified flag
+    from the guest thread after the copy landed, losing writes the command processor had
+    recorded meanwhile ("garbage collection retained GPU ownership"). Only pages without pending
+    GPU bytes lose the flag, on the GPU thread.
 
 ## Performance notes (2026-09-17)
 
@@ -85,10 +103,17 @@ cutscene on the RTX 3070 Ti / i7-11700K:
 
 - The emulator is **CPU-bound on the GPU thread**; the host GPU is not the limit. Making every
   ray miss (`KYTY_DEBUG_SKIP_BVH=1`) does not change the frame rate.
-- Scripted 5-minute intro run (start, J×3, screenshots every 30 s): the crowd scene went from
-  5 fps to ~20 fps, the bot close-up from 6 to ~30, the alien close-up from 3 to ~17, and the
-  total frame count over the first 315 s from 7,800 to 9,600. The heavy scenes issue 600–1,100
-  draws and ~100–200 compute dispatches per frame.
+- Scripted 10-minute run (start, J×3, then hold W / press J in the desert): the intro's crowd
+  scene went from 5 fps to ~29 fps, the bot close-up from 6 to ~30, the alien close-up from 3 to
+  ~17–23; gameplay in the desert runs at 30–38 fps (idle 30–35, walking ~38) when VRAM stays
+  under budget. The heavy scenes issue 600–1,100 draws and ~100–200 compute dispatches per frame.
+- The loading tunnel after the intro still never finishes in roughly half of the runs
+  ("infinite loading"). In that state the game's loader re-reads six normal maps forever and a
+  single-thread finalize kernel (hash 0x9e3c6093e9c20738, `DS_APPEND` on four GDS counters, then
+  dispatch arguments and a `-1` terminator per list) writes its 16-byte indirect arguments into
+  the same page as a compute shader's code (0x50740a520 / 0x50740a700), so the command
+  processor drains the queue once per frame reading that header. The lists are almost certainly
+  the GPU-side resource requests the streamer consumes; what makes them loop is not known.
 - What remains per frame in the crowd scene (Tracy self time): the SRT walk
   (`Srt::EvaluateRuntimeSources`, ~9 ms: ~880 walks of ~150 IR instructions and ~50 guest
   reads each; the memo hits only ~16% because the user data carries per-object constant-buffer
@@ -124,7 +149,11 @@ Environment variables (all off by default):
 | `KYTY_DEBUG_TEXTURE_TRACE=1` | Log the residency fields of mipmapped T#s and the residency decision with mip offsets. |
 | `KYTY_DEBUG_FAULT_TRACE=1` | Count guest page faults (and GPU-thread faults) in the `KYTY_DEBUG_MEM_STATS` line. |
 | `KYTY_DEBUG_READBACK_DUMP=<hex>` | Dump 64 dwords after a guest readback that faulted at that address. |
-| `KYTY_DEBUG_SRT_MEMO=1` | Per-shader SRT memo hit/miss statistics with a sample of the user data. |
+| `KYTY_DEBUG_SRT_MEMO=1` | Per-shader SRT memo statistics (hits, misses, walk time, prefills, read provenance). |
+| `KYTY_DEBUG_SRT_DEPS=<hash,...>` | Dump a shader's user data and per-source dependency masks on its first walks. |
+| `KYTY_DEBUG_SRT_RELOC=<hash>` | Dump a shader's recorded reads with their provenance and which read broke a prefill. |
+| `KYTY_DEBUG_WATCH_ADDR=<hex>` / `KYTY_DEBUG_WATCH_SIZE=<hex>` | Log GPU write bindings, copies and fills that touch that guest range, with the shader. |
+| `KYTY_NO_SRT_PREFILL=1`, `KYTY_NO_ASYNC_COPY=1` | Kill switches for the per-resource memo and the worker-thread staging copies. |
 | `KYTY_DEBUG_IMAGE_TRACE=1` | Log image creation, replacement and expansion. |
 | `KYTY_NO_RESIDENT_MIPS=1` | Treat every texture as fully resident (previous behaviour). |
 | `KYTY_NO_TEXTURE_MEMO=1`, `KYTY_NO_SRT_MEMO=1`, `KYTY_NO_IMAGE_POOL=1`, `KYTY_NO_BARRIER_COALESCE=1`, `KYTY_NO_FLUSH_LIMIT=1`, `KYTY_NO_ASYNC_READBACK=1` | Kill switches for the individual optimizations. |
