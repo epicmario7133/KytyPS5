@@ -186,6 +186,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		m_budget_gc_memory  = static_cast<uint64_t>(budget);
 	}
 }
 
@@ -257,7 +258,9 @@ bool TextureCache::SafeToDownload(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	m_graphics.reclaim_device_memory = [this](uint64_t bytes) { return ReclaimMemory(bytes); };
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	m_graphics.reclaim_device_memory = nullptr;
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1795,7 +1798,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		// Larger than the download ring, or the ring is still in flight: the caller keeps the
+		// image resident instead.
+		return false;
 	}
 	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
@@ -1803,6 +1808,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	}
 	download.Flush(offset, range.size);
 
+	m_download_count++;
 	DownloadImage(image, download, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
@@ -1880,6 +1886,18 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::IsDccMetadataRange(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	bool             found = false;
+	m_slot_images.ForEach([&](ImageId, const Image& image) {
+		if (!found && image.registered && image.info.metadata.kind == ImageMetadataKind::Dcc &&
+		    image.info.metadata.range.address == address && image.info.metadata.range.size == size) {
+			found = true;
+		}
+	});
+	return found;
+}
+
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
@@ -1942,6 +1960,47 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::ReclaimMemory(uint64_t bytes) {
+	// Leave headroom so the next few allocations do not fail again immediately.
+	const uint64_t       target = bytes + 512ull * 1024 * 1024;
+	uint64_t             freed  = 0;
+	std::vector<ImageId> candidates;
+	// Images touched during this collection tick are part of the work being recorded.
+	m_lru_cache.ForEachItemBelow(m_gc_tick > 0 ? m_gc_tick - 1 : 0, [&](ImageId id) {
+		candidates.push_back(id);
+		return false;
+	});
+	size_t evicted = 0;
+	for (const auto id: candidates) {
+		if (freed >= target) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			continue;
+		}
+		if (owner->IsGpuModified() && (!SafeToDownload(*owner) || !DownloadImageMemory(id))) {
+			continue;
+		}
+		freed += owner->AccountedSize();
+		FreeImage(id);
+		evicted++;
+	}
+	if (evicted == 0) {
+		return false;
+	}
+	// Deletions are deferred until the GPU is done with the images; drain now so the memory
+	// is actually returned before the retry.
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	m_scheduler.PopPendingOperations();
+	LOGF("TextureCache: device memory exhausted, evicted %zu images (%" PRIu64 " MiB) for a %" PRIu64
+	     " MiB allocation\n",
+	     evicted, freed >> 20, bytes >> 20);
+	return true;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
@@ -1954,8 +2013,11 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		// Past the reported budget the driver is already paging; sweep young images in bulk.
+		const bool     over_budget = aggressive && m_total_used_memory >= m_budget_gc_memory;
+		const uint64_t age       = std::min<uint64_t>(
+		    over_budget ? 8 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		size_t         deletions = over_budget ? 200 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal

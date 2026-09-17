@@ -50,6 +50,15 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	[[nodiscard]] uint64_t DownloadCount() const noexcept { return m_download_count; }
+	// Bytes of image memory the cache holds and the number of live images.
+	[[nodiscard]] std::pair<uint64_t, size_t> MemoryStats() {
+		std::scoped_lock lock {m_lock};
+		uint64_t         bytes = 0;
+		m_slot_images.ForEach([&](ImageId, const Image& image) { bytes += image.AccountedSize(); });
+		return {bytes, m_slot_images.size()};
+	}
+
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -59,6 +68,8 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// True when [address, size) is exactly the DCC metadata of a cached image.
+	[[nodiscard]] bool IsDccMetadataRange(uint64_t address, uint64_t size);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
@@ -149,6 +160,9 @@ private:
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	// Caller holds m_lock. Evicts least recently used images until at least bytes of device
+	// memory were released and the GPU has finished with them.
+	[[nodiscard]] bool ReclaimMemory(uint64_t bytes);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
@@ -179,6 +193,8 @@ private:
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
+	uint64_t                                          m_budget_gc_memory   = UINT64_MAX;
+	uint64_t                                          m_download_count     = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;

@@ -686,9 +686,15 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		// Device memory is full. Let the owning cache evict before giving up: streamed titles
+		// keep more textures resident than a discrete card holds.
+		const uint64_t needed = std::max<uint64_t>(info.data.size, 64ull * 1024 * 1024);
+		if (!graphics.reclaim_device_memory || !graphics.reclaim_device_memory(needed) ||
+		    !graphics.CreateImage(create, backing)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+			     create.extent.width, create.extent.height, create.extent.depth,
+			     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		}
 	}
 }
 
