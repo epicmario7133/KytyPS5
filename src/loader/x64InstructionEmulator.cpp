@@ -585,6 +585,57 @@ static bool TryEmulateSse4a(Context& context) {
 	return true;
 }
 
+// AMD SSE4a register-form EXTRQ (66 0F 79 /r) and INSERTQ (F2 0F 79 /r): the length and index
+// travel in the source register instead of immediates.
+static bool TryEmulateSse4aRegisterForm(Context& context) {
+	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
+	const uint8_t prefix = rip[0];
+	if (prefix != 0x66 && prefix != 0xf2) {
+		return false;
+	}
+
+	size_t  offset = 1;
+	uint8_t rex    = 0;
+	if ((rip[offset] & 0xf0u) == 0x40u) {
+		rex = rip[offset++];
+	}
+	if (rip[offset] != 0x0f || rip[offset + 1] != 0x79) {
+		return false;
+	}
+
+	const uint8_t modrm = rip[offset + 2];
+	if ((modrm & 0xc0u) != 0xc0u) {
+		return false;
+	}
+
+	const uint8_t reg      = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+	const uint8_t rm       = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+	auto*         dest_xmm = context.Xmm(reg);
+	auto*         src_xmm  = context.Xmm(rm);
+	if (dest_xmm == nullptr || src_xmm == nullptr) {
+		return false;
+	}
+	uint64_t dest[2] {};
+	uint64_t source[2] {};
+	std::memcpy(dest, dest_xmm, sizeof(dest));
+	std::memcpy(source, src_xmm, sizeof(source));
+	if (prefix == 0x66) {
+		// EXTRQ xmm1, xmm2: length = xmm2[5:0], index = xmm2[13:8].
+		const auto length = static_cast<uint32_t>(source[0] & 0x3fu);
+		const auto index  = static_cast<uint32_t>((source[0] >> 8u) & 0x3fu);
+		dest[0]           = ExtractBitField(dest[0], length, index);
+	} else {
+		// INSERTQ xmm1, xmm2: bits = xmm2[63:0], length = xmm2[69:64], index = xmm2[77:72].
+		const auto length = static_cast<uint32_t>(source[1] & 0x3fu);
+		const auto index  = static_cast<uint32_t>((source[1] >> 8u) & 0x3fu);
+		dest[0]           = InsertBitField(dest[0], source[0], length, index);
+	}
+	dest[1] = 0;
+	std::memcpy(dest_xmm, dest, sizeof(dest));
+	context.Advance(offset + 3);
+	return true;
+}
+
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
@@ -726,7 +777,7 @@ bool TryEmulate(void* native_context) {
 		return true;
 	}
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
+	       TryEmulateSse4aRegisterForm(context) || TryEmulateShaNi(context);
 #else
 	(void)native_context;
 	return false;
