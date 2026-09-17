@@ -626,7 +626,9 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EIO;
 	}
 
-	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
+	LOGF("\tRead %u bytes (req %" PRIu64 " to 0x%016" PRIx64 " tid %d) from: %s\n", bytes_read,
+	     static_cast<uint64_t>(nbytes), reinterpret_cast<uint64_t>(buf),
+	     Common::Thread::GetThreadIdUnique(), Common::PathToString(file->real_name).c_str());
 
 	return bytes_read;
 }
@@ -753,8 +755,9 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EIO;
 	}
 
-	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
-	     Common::PathToString(file->real_name).c_str());
+	LOGF("\tRead %u bytes (pos = %" PRId64 ", req %" PRIu64 " to 0x%016" PRIx64 " tid %d) from: %s\n",
+	     bytes_read, offset, static_cast<uint64_t>(nbytes), reinterpret_cast<uint64_t>(buf),
+	     Common::Thread::GetThreadIdUnique(), Common::PathToString(file->real_name).c_str());
 
 	return bytes_read;
 }
