@@ -5,7 +5,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -377,6 +379,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		// KYTY_DEBUG_SYNC_SUBMITS serializes the queue so a device loss is attributed to the
+		// command buffer that caused it rather than to a later submission.
+		static const bool sync_submits = std::getenv("KYTY_DEBUG_SYNC_SUBMITS") != nullptr;
+		if (sync_submits && result == vk::Result::eSuccess) {
+			result = graphics.queue.waitIdle();
+			LOGF("submit sync: tick=%" PRIu64 " op=%u submit=%" PRIu64
+			     " args=%u,%u,%u,%u,0x%016" PRIx64 " result=%d\n",
+			     tick, m_command.m_debug_op, m_command.m_debug_submit_id, m_command.m_debug_arg0,
+			     m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
+			     m_command.m_debug_arg4, static_cast<int>(result));
+		}
 	}
 
 	if (result != vk::Result::eSuccess) {
