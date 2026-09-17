@@ -38,6 +38,15 @@ public:
 	void              SubmitFlipPreparation(uint64_t request_id);
 	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
+	// Diagnostics: where the GPU thread spends its time, in nanoseconds.
+	struct ThreadStats {
+		uint64_t idle_ns    = 0; // no work queued
+		uint64_t blocked_ns = 0; // every queued submission is blocked on a GPU condition
+		uint64_t blocked    = 0; // number of such 100 ms polls
+		uint64_t process_ns = 0; // command processing
+		uint64_t command_ns = 0; // host commands (readbacks, invalidations)
+	};
+	[[nodiscard]] ThreadStats GetThreadStats() const noexcept { return m_thread_stats; }
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -83,6 +92,7 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	ThreadStats                                    m_thread_stats;
 	bool                                           m_processing        = false;
 	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;

@@ -154,6 +154,13 @@ void RenderContext::RunGarbageCollector() {
 		     master.BlockingWaitNanoseconds() / 1000000, m_command_scheduler.DrainCount(),
 		     m_command_scheduler.StreamWaitCount(), m_buffer_cache.ReadbackCount(),
 		     m_texture_cache.DownloadCount());
+		if (m_gpu != nullptr) {
+			const auto stats = m_gpu->GetThreadStats();
+			LOGF("GpuThread: idle=%" PRIu64 " ms blocked=%" PRIu64 " ms (%" PRIu64
+			     " polls) process=%" PRIu64 " ms commands=%" PRIu64 " ms\n",
+			     stats.idle_ns / 1000000, stats.blocked_ns / 1000000, stats.blocked,
+			     stats.process_ns / 1000000, stats.command_ns / 1000000);
+		}
 	}
 }
 

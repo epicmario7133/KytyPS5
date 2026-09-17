@@ -684,9 +684,12 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 }
 
 struct DrawEmitInfo {
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
+	int32_t  vertex_offset  = 0;
+	uint32_t first_vertex   = 0;
 	uint32_t first_instance = 0;
+	// When set, the draw parameters come from this GPU buffer instead of the fields above.
+	vk::Buffer indirect_buffer;
+	uint64_t   indirect_offset = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -952,6 +955,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	KYTY_PROFILER_BLOCK("Draw::GetGraphicsPrograms");
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
@@ -961,7 +965,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	{
+		KYTY_PROFILER_BLOCK("Draw::RefreshShaders");
+		RefreshShaders(buffer, draw, state);
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1075,7 +1082,15 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
 		case Prospero::PrimitiveType::kPatch:
-			if (draw.IsIndexed()) {
+			if (emit.indirect_buffer) {
+				if (draw.IsIndexed()) {
+					vk_buffer.drawIndexedIndirect(emit.indirect_buffer, emit.indirect_offset, 1,
+					                              sizeof(vk::DrawIndexedIndirectCommand));
+				} else {
+					vk_buffer.drawIndirect(emit.indirect_buffer, emit.indirect_offset, 1,
+					                       sizeof(vk::DrawIndirectCommand));
+				}
+			} else if (draw.IsIndexed()) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
 			} else {
@@ -1152,6 +1167,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	Profiler::ScopedBlock            phase_bindings(KYTY_PROFILER_SOURCE("Draw::PrepareBindings"));
 	GraphicsBindings                 bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1164,25 +1180,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	phase_bindings.End();
+	{
+		KYTY_PROFILER_BLOCK("Draw::PrepareGraphicsBindings");
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+		KYTY_PROFILER_BLOCK("Draw::PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	Profiler::ScopedBlock phase_targets(KYTY_PROFILER_SOURCE("Draw::AcquireRenderTargets"));
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
+	phase_targets.End();
 
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	Profiler::ScopedBlock phase_pipeline(KYTY_PROFILER_SOURCE("Draw::GetGraphicsPipeline"));
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	phase_pipeline.End();
+	Profiler::ScopedBlock phase_commit(KYTY_PROFILER_SOURCE("Draw::Commit"));
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1363,6 +1389,18 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	if (args.indirect_args_addr != 0) {
+		// Indices rewritten on the host (8-bit, restart) or mesh input would not match the
+		// GPU-side first_index; those draws keep the faulting snapshot path.
+		if (!expanded_indices.empty() ||
+		    state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+			EXIT_NOT_IMPLEMENTED(true);
+		}
+		auto [indirect_buffer, indirect_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args.indirect_args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+		emit.indirect_buffer = indirect_buffer->Handle();
+		emit.indirect_offset = indirect_offset;
+	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1452,6 +1490,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	if (args.indirect_args_addr != 0) {
+		EXIT_NOT_IMPLEMENTED(state.vertex_info[0].stage.program->stage == ShaderType::Mesh);
+		auto [indirect_buffer, indirect_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args.indirect_args_addr, sizeof(vk::DrawIndirectCommand), false);
+		emit.indirect_buffer = indirect_buffer->Handle();
+		emit.indirect_offset = indirect_offset;
+	}
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

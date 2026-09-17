@@ -16,12 +16,14 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -385,6 +387,16 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
+	// The tables are CPU-written but often share pages with GPU-written data; going through
+	// the guest mapping would fault and drain the GPU queue for every draw.
+	const auto read_guest = [](const uint32_t* source, uint32_t* destination, size_t dwords) {
+		const auto address = reinterpret_cast<uint64_t>(source);
+		if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, destination,
+		                                                     dwords * sizeof(uint32_t))) {
+			std::memcpy(destination, source, dwords * sizeof(uint32_t));
+		}
+	};
+
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
@@ -393,16 +405,17 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attrib_word = 0;
+		read_guest(&attrib[in.semantic], &attrib_word, 1);
 		if (Config::GraphicsDebugDumpEnabled()) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib_word);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
+		size_t index = attrib_word & 0x1fu;
 		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		    static_cast<Prospero::VertexAttribFormat>((attrib_word >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib_word >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib_word >> 26u) & 0x1u;
 
 		if (fetch_index != 0) {
 			static std::atomic<uint64_t> log_count = 0;
@@ -416,7 +429,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		read_guest(&buffer[index * 4], sharp, 4);
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 

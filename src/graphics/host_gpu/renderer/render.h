@@ -62,6 +62,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// GPU-written VkDrawIndexedIndirectCommand to draw from; the other fields are then the
+	// host's conservative snapshot (index_count is the whole bound index buffer).
+	uint64_t         indirect_args_addr         = 0;
 };
 
 struct DrawAutoArgs {
@@ -71,6 +74,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// GPU-written VkDrawIndirectCommand to draw from (see DrawIndexArgs).
+	uint64_t         indirect_args_addr         = 0;
 };
 
 struct SubmitInfo {

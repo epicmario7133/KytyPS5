@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <deque>
 #include <memory>
@@ -472,6 +473,11 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	using Clock       = std::chrono::steady_clock;
+	const auto elapsed = [](Clock::time_point since) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - since).count());
+	};
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -482,7 +488,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto start = Clock::now();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				gpu->m_thread_stats.idle_ns += elapsed(start);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -504,7 +512,10 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const auto start = Clock::now();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					gpu->m_thread_stats.blocked_ns += elapsed(start);
+					gpu->m_thread_stats.blocked++;
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -530,7 +541,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto start = Clock::now();
 			command();
+			gpu->m_thread_stats.command_ns += elapsed(start);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -541,7 +554,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto process_start = Clock::now();
+		const bool complete      = gpu->Process(submission);
+		gpu->m_thread_stats.process_ns += elapsed(process_start);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -906,12 +921,27 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
 
+	// Arguments a GPU pass produced (culling, instancing) are consumed on the GPU: reading them
+	// through the guest mapping would fault and drain the queue every draw. Mesh (NGG) draws
+	// derive their workgroup count and index pointer on the host, so they keep the snapshot.
+	const bool mesh_draw = (CurrentBuffer().GetRegisters().GetShaderStages() & 0x20u) != 0;
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		if (!mesh_draw &&
+		    !LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args))) {
+			DrawIndexAuto({.vertex_count       = 1,
+			               .instance_count     = 1,
+			               .first_vertex       = 0,
+			               .first_instance     = 0,
+			               .offset_source      = DrawOffsetSource::IndirectArgs,
+			               .indirect_args_addr = args_addr});
+			return;
+		}
+		if (mesh_draw) {
+			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		}
 		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
 		    args.start_instance_location != 0u) {
 			static std::atomic<uint32_t> log_count {0};
@@ -932,8 +962,32 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		return;
 	}
 
+	uint64_t index_size = 0;
+	switch (m_index_type_and_size) {
+		case 0: index_size = 2; break;
+		case 1: index_size = 4; break;
+		case 2: index_size = 1; break;
+		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
+	}
+
 	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(args_addr, &args, sizeof(args))) {
+		// 8-bit indices are expanded on the host, which the GPU-side first_index cannot follow.
+		if (!mesh_draw && m_index_buffer_size != 0 && index_size != 1) {
+			// The whole bound index buffer is the conservative range; first_index comes from
+			// the GPU-side arguments.
+			m_num_instances = 1;
+			DrawIndex({.index_count        = m_index_buffer_size,
+			           .index_addr         = reinterpret_cast<const void*>(m_index_base_addr),
+			           .instance_count     = 1,
+			           .base_vertex        = 0,
+			           .first_instance     = 0,
+			           .offset_source      = DrawOffsetSource::IndirectArgs,
+			           .indirect_args_addr = args_addr});
+			return;
+		}
+		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+	}
 	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 64) {
@@ -943,14 +997,6 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 			     args.index_count_per_instance, args.instance_count, args.start_index_location,
 			     args.base_vertex_location, args.start_instance_location);
 		}
-	}
-
-	uint64_t index_size = 0;
-	switch (m_index_type_and_size) {
-		case 0: index_size = 2; break;
-		case 1: index_size = 4; break;
-		case 2: index_size = 1; break;
-		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
 	}
 
 	auto* index_addr = reinterpret_cast<const void*>(
