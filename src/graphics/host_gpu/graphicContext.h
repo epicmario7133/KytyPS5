@@ -98,6 +98,13 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	struct DeviceMemoryStatistics {
+		uint64_t allocation_bytes = 0; // bytes handed out by the allocator (device-local heaps)
+		uint64_t block_bytes      = 0; // bytes of the memory blocks backing them
+		uint32_t allocations      = 0;
+		uint32_t blocks           = 0;
+	};
+	[[nodiscard]] DeviceMemoryStatistics GetDeviceMemoryStatistics() const;
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);

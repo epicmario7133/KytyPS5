@@ -1082,7 +1082,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	};
 
 	if (binding != BindingType::DepthTarget) {
+		Profiler::ScopedBlock layout_block(KYTY_PROFILER_SOURCE("Upload::Layout"));
 		auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		layout_block.End();
 		if (!transfer.valid) {
 			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
@@ -1130,6 +1132,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		}
 		TileManager::Result linear {source.Handle(), source_offset, resident_size};
 		if (!transfer.tiles.empty()) {
+			KYTY_PROFILER_BLOCK("Upload::Detile");
 			linear = m_tiler.Detile(source.Handle(), source_offset, resident_size,
 			                        transfer.LinearSize(), transfer.tiles);
 		}
@@ -1199,8 +1202,10 @@ void TextureCache::InitializeImage(ImageId id) {
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
 		const auto resident = image.info.ResidentRange();
+		Profiler::ScopedBlock source_block(KYTY_PROFILER_SOURCE("Upload::Source"));
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(resident.address, resident.size);
+		source_block.End();
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -2139,8 +2144,12 @@ void TextureCache::RunGarbageCollector() {
 		if (over_budget) {
 			m_scheduler.Context().GetImagePool().Clear();
 		}
+		// The collector runs several times per frame (about eight in Astro Bot), and the heap
+		// usage it compares against includes everything the process allocated, so the
+		// pressured tier is the normal state on an 8 GiB card. Ages are in collector runs:
+		// evicting anything younger than a few frames only re-uploads it next frame.
 		const uint64_t age       = std::min<uint64_t>(
-		    over_budget ? 8 : aggressive ? 160 : pressured ? 80 : 16, tick);
+		    over_budget ? 32 : aggressive ? 96 : pressured ? 320 : 640, tick);
 		size_t         deletions = over_budget ? 200 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);

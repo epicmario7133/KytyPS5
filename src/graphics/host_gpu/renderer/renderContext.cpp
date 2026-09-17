@@ -170,6 +170,13 @@ void RenderContext::RunGarbageCollector() {
 		     m_command_scheduler.StreamWaitCount(), m_buffer_cache.ReadbackCount(),
 		     m_texture_cache.DownloadCount(), m_fault_count.load(std::memory_order_relaxed),
 		     m_gpu_fault_count.load(std::memory_order_relaxed), m_buffer_cache.StalePageCount());
+		{
+			const auto vma = m_graphics.GetDeviceMemoryStatistics();
+			LOGF("DeviceMem: vma_allocations=%u (%" PRIu64 " MiB) vma_blocks=%u (%" PRIu64
+			     " MiB) image_pool=%" PRIu64 " MiB\n",
+			     vma.allocations, vma.allocation_bytes >> 20, vma.blocks, vma.block_bytes >> 20,
+			     m_image_pool.Bytes() >> 20);
+		}
 		if (m_gpu != nullptr) {
 			const auto stats = m_gpu->GetThreadStats();
 			LOGF("GpuThread: idle=%" PRIu64 " ms blocked=%" PRIu64 " ms (%" PRIu64
