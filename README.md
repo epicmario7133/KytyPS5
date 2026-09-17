@@ -12,6 +12,13 @@ with experimental macOS support. It is based on a heavily modified version of
 [Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
 compatibility is limited and behavior may change significantly between builds.
 
+> [!NOTE]
+> **This fork exists solely for Astro Bot development.** The game currently runs well: it boots,
+> reaches the main menu and a new save can be started. What remains is fixing a few materials and
+> improving the frame rate. See [docs/astro-bot.md](docs/astro-bot.md) for the list of fixes, the
+> current state and the debugging switches added along the way. Upstream:
+> [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
+
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
 > not distribute games or copyrighted system software. Use only game files that you have obtained
