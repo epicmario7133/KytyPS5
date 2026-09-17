@@ -1052,6 +1052,24 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 	return blocks;
 }
 
+// An unreachable merge for a selection whose arms all leave the enclosing loop before
+// rejoining; SPIR-V still requires the header to name a merge block.
+uint32_t AppendSyntheticReturnBlock(Graph& graph, uint32_t after) {
+	const auto* after_block = graph.FindBlock(after);
+
+	BasicBlock block;
+	block.id                           = static_cast<uint32_t>(graph.blocks.size());
+	block.start_pc                     = after_block != nullptr ? after_block->end_pc : 0u;
+	block.end_pc                       = block.start_pc;
+	block.inst_begin                   = after_block != nullptr ? after_block->inst_end : 0u;
+	block.inst_end                     = block.inst_begin;
+	block.terminator.kind              = TerminatorKind::Return;
+	block.terminator.condition         = BranchCondition::Always;
+	block.terminator.unreachable_merge = true;
+	graph.blocks.push_back(std::move(block));
+	return graph.blocks.back().id;
+}
+
 uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
 	const auto* target_block = graph.FindBlock(target);
 
@@ -1255,12 +1273,16 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 	}
 	const bool true_in_body  = Contains(loop->body_blocks, true_target);
 	const bool false_in_body = Contains(loop->body_blocks, false_target);
-	if (true_in_body != false_in_body) {
-		return true;
-	}
 	const auto is_control_target = [&](uint32_t target) {
 		return target == loop->merge || target == loop->continue_block;
 	};
+	if (true_in_body != false_in_body) {
+		// An arm that leaves the natural loop body through blocks still dominated by the
+		// header (a nested loop that only breaks, for instance) is not a direct break or
+		// continue and still needs a selection merge.
+		const auto outside = true_in_body ? false_target : true_target;
+		return is_control_target(outside) || !IsInsideLoopConstruct(graph, *loop, outside);
+	}
 	return (is_control_target(true_target) &&
 	        (is_control_target(false_target) ||
 	         IsInsideLoopConstruct(graph, *loop, false_target))) ||
@@ -2165,26 +2187,34 @@ bool StructurizeImpl(Graph& graph) {
 		header->terminator.continue_block = loop.continue_block;
 	}
 
-	for (auto& block: graph.blocks) {
-		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
-		    block.terminator.loop_header) {
+	const auto block_count = graph.blocks.size();
+	for (size_t index = 0; index < block_count; index++) {
+		const auto block_id = graph.blocks[index].id;
+		if (graph.blocks[index].terminator.kind != TerminatorKind::ConditionalBranch ||
+		    graph.blocks[index].terminator.loop_header) {
 			continue;
 		}
-		if (IsInnermostLoopControlConditional(graph, block)) {
+		if (IsInnermostLoopControlConditional(graph, graph.blocks[index])) {
 			continue;
 		}
 
-		const auto merge = FindSelectionMerge(graph, block);
+		auto merge = FindSelectionMerge(graph, graph.blocks[index]);
 		if (merge == UINT32_MAX) {
-			SetFailure(graph, FailureKind::StructuredControlFlow, block.id,
-			           fmt::format("conditional block {} has no structured merge", block.id));
+			SetFailure(graph, FailureKind::StructuredControlFlow, block_id,
+			           fmt::format("conditional block {} has no structured merge", block_id));
 			return false;
+		}
+		// Arms that only rejoin at or beyond the enclosing loop boundary cannot share the
+		// loop's merge; give the selection a private unreachable merge instead.
+		if (const auto* loop = FindInnermostContainingLoop(graph, block_id);
+		    loop != nullptr && !IsInsideLoopConstruct(graph, *loop, merge)) {
+			merge = AppendSyntheticReturnBlock(graph, block_id);
 		}
 
-		if (!reserve_merge_block(block.id, merge)) {
+		if (!reserve_merge_block(block_id, merge)) {
 			return false;
 		}
-		block.terminator.merge_block = merge;
+		graph.blocks[index].terminator.merge_block = merge;
 	}
 
 	return true;
