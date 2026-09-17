@@ -593,11 +593,29 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	// The draw data lives in a small device buffer (so GPU-written indirect arguments can fill
+	// it); push constants 0 and 1 hold its address. Programs without physical addressing keep
+	// the parameters themselves in push constants.
+	const auto load_push = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	if (!state.program.info.uses_dma) {
+		return load_push(index);
+	}
+	const auto address = Binary(
+	    state, spv::OpIAdd, TypeScalarU64(state), DeviceAddressFromWords(state, load_push(0), load_push(1)),
+	    ConstantDeviceAddress(state, index * sizeof(uint32_t)));
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          address);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+	                          spv::MemoryAccessAlignedMask, static_cast<uint32_t>(sizeof(uint32_t)));
 	return result;
 }
 

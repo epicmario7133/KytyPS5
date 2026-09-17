@@ -20,6 +20,7 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -281,8 +282,9 @@ void CommandProcessor::BufferFlush() {
 }
 
 void CommandProcessor::BufferFlushForInterrupt() {
-	const auto now = MonotonicNs();
-	if (now - m_last_interrupt_flush_ns >= FlushIntervalNs) {
+	static const bool limit_disabled = std::getenv("KYTY_NO_FLUSH_LIMIT") != nullptr;
+	const auto        now            = MonotonicNs();
+	if (limit_disabled || now - m_last_interrupt_flush_ns >= FlushIntervalNs) {
 		m_interrupt_flush_pending = false;
 		m_last_interrupt_flush_ns = now;
 		GetScheduler().Flush();
@@ -960,8 +962,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	// Arguments a GPU pass produced (culling, instancing) are consumed on the GPU: reading them
 	// through the guest mapping would fault and drain the queue every draw. Mesh (NGG) draws
-	// derive their workgroup count and index pointer on the host, so they keep the snapshot.
-	const bool mesh_draw = (CurrentBuffer().GetRegisters().GetShaderStages() & 0x20u) != 0;
+	// convert them with a small compute pass into their draw data.
+	const bool mesh_draw = false;
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		if (!mesh_draw &&
@@ -1511,15 +1513,17 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
+	KYTY_PROFILER_FUNCTION();
 	CheckBuffer();
 
 	Common::LockGuard lock(m_renderer.GetMutex());
 
 	// Titles emit hundreds of cache-flush events per frame; a second full barrier with no draw
 	// or dispatch recorded in between orders nothing new.
-	const auto serial = CurrentBuffer().WorkSerial();
-	const auto tick   = GetScheduler().CurrentTick();
-	if (serial == m_barrier_work_serial && tick == m_barrier_tick) {
+	static const bool coalesce_disabled = std::getenv("KYTY_NO_BARRIER_COALESCE") != nullptr;
+	const auto        serial            = CurrentBuffer().WorkSerial();
+	const auto        tick              = GetScheduler().CurrentTick();
+	if (!coalesce_disabled && serial == m_barrier_work_serial && tick == m_barrier_tick) {
 		return;
 	}
 
@@ -1701,6 +1705,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	KYTY_PROFILER_FUNCTION();
 	GetScheduler().Finish();
 }
 

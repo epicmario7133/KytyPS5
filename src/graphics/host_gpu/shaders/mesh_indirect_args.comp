@@ -1,0 +1,52 @@
+// Converts guest DRAW_INDIRECT / DRAW_INDEX_INDIRECT arguments written by the GPU into the
+// mesh-shader draw data and the VkDrawMeshTasksIndirectCommandEXT the host mesh path consumes,
+// so a GPU-culled draw never has to be read back on the CPU.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint v[];
+};
+
+layout(push_constant) uniform Params {
+    uint64_t args;             // guest arguments (5 dwords indexed, 4 dwords otherwise)
+    uint64_t output_data;      // 6 draw-data dwords followed by the 3 mesh task counts
+    uint64_t index_base;       // bound index buffer address (indexed draws)
+    uint index_bytes;          // 0 for non-indexed draws
+    uint primitives_per_group;
+    uint primitive_size;
+    uint primitive_step;
+    uint max_groups;
+} params;
+
+void main() {
+    Words args = Words(params.args);
+    Words output_data = Words(params.output_data);
+    const bool indexed = params.index_bytes != 0u;
+    const uint count = args.v[0];
+    const uint instances = args.v[1];
+    const uint first = args.v[2];           // first index or first vertex
+    const uint vertex_offset = indexed ? args.v[3] : first;
+    const uint first_instance = indexed ? args.v[4] : args.v[3];
+
+    uint primitives = count < params.primitive_size
+        ? 0u
+        : (count - params.primitive_size) / params.primitive_step + 1u;
+    uint groups = primitives == 0u ? 0u : (primitives - 1u) / params.primitives_per_group + 1u;
+    groups = min(groups, params.max_groups);
+
+    uint64_t index_address = indexed ? params.index_base + uint64_t(first) * uint64_t(params.index_bytes) : uint64_t(0);
+
+    output_data.v[0] = count;
+    output_data.v[1] = vertex_offset;
+    output_data.v[2] = first_instance;
+    output_data.v[3] = params.index_bytes;
+    output_data.v[4] = uint(index_address);
+    output_data.v[5] = uint(index_address >> 32);
+    output_data.v[6] = groups;
+    output_data.v[7] = groups == 0u ? 0u : instances;
+    output_data.v[8] = 1u;
+}

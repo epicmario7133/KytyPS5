@@ -690,6 +690,9 @@ struct DrawEmitInfo {
 	// When set, the draw parameters come from this GPU buffer instead of the fields above.
 	vk::Buffer indirect_buffer;
 	uint64_t   indirect_offset = 0;
+	// Mesh draws: device address of the guest arguments, converted on the GPU.
+	vk::DeviceAddress indirect_arguments = 0;
+	uint64_t          indirect_guest     = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1131,8 +1134,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
-	if (mesh_active) {
+	const bool mesh_indirect =
+	    mesh_active && emit.indirect_arguments != 0 &&
+	    state.vertex_info[0].stage.program->info.uses_dma;
+	uint32_t mesh_groups = 0;
+	if (mesh_active && !mesh_indirect) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
 		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
@@ -1222,18 +1228,51 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	MeshIndirect::Slot mesh_slot;
 	if (mesh_active) {
-		const uint32_t draw_data[] {
+		const uint32_t draw_data[MeshIndirect::DrawDataDwords] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 		    emit.first_instance, index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		vk_buffer.pushConstants(pipeline.pipeline_layout,
-		                        vk::ShaderStageFlagBits::eMeshEXT |
-		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		if (state.vertex_info[0].stage.program->info.uses_dma) {
+			// The program reads its draw data through the address in push constants.
+			if (m_mesh_indirect == nullptr) {
+				m_mesh_indirect = std::make_unique<MeshIndirect>(
+				    m_context.GetGraphics(), m_context.GetCommandScheduler());
+			}
+			buffer.EndRendering();
+			mesh_slot = m_mesh_indirect->Allocate();
+			if (mesh_indirect) {
+				const auto& mesh = state.vertex_info[0].mesh;
+				MeshIndirect::ConvertParams params {};
+				params.arguments            = emit.indirect_arguments;
+				params.index_base           = index_source.address;
+				params.index_bytes          = draw.IsIndexed() ? index_source.guest_element_size : 0u;
+				params.primitives_per_group = std::max(mesh.primitives_per_group, 1u);
+				params.primitive_size       = mesh.InputPrimitiveSize();
+				params.primitive_step       = std::max(mesh.InputPrimitiveStep(), 1u);
+				params.max_groups =
+				    m_context.GetGraphics().mesh_shader_properties.maxMeshWorkGroupCount[0];
+				m_mesh_indirect->Convert(vk_buffer, mesh_slot, params);
+			} else {
+				m_mesh_indirect->WriteDirect(vk_buffer, mesh_slot, draw_data);
+			}
+			const uint32_t address_data[MeshIndirect::DrawDataDwords] {
+			    static_cast<uint32_t>(mesh_slot.address),
+			    static_cast<uint32_t>(mesh_slot.address >> 32u), 0u, 0u, 0u, 0u};
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eMeshEXT |
+			                            vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(address_data), address_data);
+		} else {
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eMeshEXT |
+			                            vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(draw_data), draw_data);
+		}
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
@@ -1256,7 +1295,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_indirect) {
+		vk_buffer.drawMeshTasksIndirectEXT(m_mesh_indirect->Handle(),
+		                                   mesh_slot.offset + MeshIndirect::TasksOffset, 1,
+		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vertex_info[0], draw, emit);
@@ -1370,8 +1413,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count, args.instance_count,
+	                   args.first_instance};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1389,17 +1432,37 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
-	if (args.indirect_args_addr != 0) {
-		// Indices rewritten on the host (8-bit, restart) or mesh input would not match the
-		// GPU-side first_index; those draws keep the faulting snapshot path.
-		if (!expanded_indices.empty() ||
-		    state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
-			EXIT_NOT_IMPLEMENTED(true);
-		}
+	auto     indirect_args_addr = args.indirect_args_addr;
+	if (indirect_args_addr != 0 &&
+	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh &&
+	    !state.vertex_info[0].stage.program->info.uses_dma) {
+		// A mesh program that keeps its draw data in push constants needs the host values:
+		// read the arguments through the guest mapping (this drains the queue).
+		vk::DrawIndexedIndirectCommand guest_args {};
+		std::memcpy(&guest_args, reinterpret_cast<const void*>(indirect_args_addr),
+		            sizeof(guest_args));
+		draw.index_count    = guest_args.indexCount;
+		draw.instance_count = guest_args.instanceCount;
+		emit.vertex_offset  = guest_args.vertexOffset;
+		emit.first_instance = guest_args.firstInstance;
+		index_source.address += static_cast<uint64_t>(guest_args.firstIndex) *
+		                        index_source.guest_element_size;
+		index_source.size = static_cast<uint64_t>(guest_args.indexCount) *
+		                    index_source.guest_element_size;
+		indirect_args_addr = 0;
+	}
+	if (indirect_args_addr != 0) {
+		// Indices rewritten on the host (8-bit) would not match the GPU-side first_index.
+		EXIT_NOT_IMPLEMENTED(!expanded_indices.empty());
 		auto [indirect_buffer, indirect_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    args.indirect_args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
-		emit.indirect_buffer = indirect_buffer->Handle();
-		emit.indirect_offset = indirect_offset;
+		    indirect_args_addr, sizeof(vk::DrawIndexedIndirectCommand), false);
+		if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+			emit.indirect_arguments = indirect_buffer->BufferDeviceAddress() + indirect_offset;
+			emit.indirect_guest     = indirect_args_addr;
+		} else {
+			emit.indirect_buffer = indirect_buffer->Handle();
+			emit.indirect_offset = indirect_offset;
+		}
 	}
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
@@ -1453,8 +1516,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
+	                   args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, true, topology)) {
@@ -1490,12 +1553,29 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
-	if (args.indirect_args_addr != 0) {
-		EXIT_NOT_IMPLEMENTED(state.vertex_info[0].stage.program->stage == ShaderType::Mesh);
+	auto indirect_args_addr = args.indirect_args_addr;
+	if (indirect_args_addr != 0 &&
+	    state.vertex_info[0].stage.program->stage == ShaderType::Mesh &&
+	    !state.vertex_info[0].stage.program->info.uses_dma) {
+		vk::DrawIndirectCommand guest_args {};
+		std::memcpy(&guest_args, reinterpret_cast<const void*>(indirect_args_addr),
+		            sizeof(guest_args));
+		draw.index_count    = guest_args.vertexCount;
+		draw.instance_count = guest_args.instanceCount;
+		emit.first_vertex   = guest_args.firstVertex;
+		emit.first_instance = guest_args.firstInstance;
+		indirect_args_addr  = 0;
+	}
+	if (indirect_args_addr != 0) {
 		auto [indirect_buffer, indirect_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    args.indirect_args_addr, sizeof(vk::DrawIndirectCommand), false);
-		emit.indirect_buffer = indirect_buffer->Handle();
-		emit.indirect_offset = indirect_offset;
+		    indirect_args_addr, sizeof(vk::DrawIndirectCommand), false);
+		if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+			emit.indirect_arguments = indirect_buffer->BufferDeviceAddress() + indirect_offset;
+			emit.indirect_guest     = indirect_args_addr;
+		} else {
+			emit.indirect_buffer = indirect_buffer->Handle();
+			emit.indirect_offset = indirect_offset;
+		}
 	}
 
 	DrawIndexBufferSource index_source {};
