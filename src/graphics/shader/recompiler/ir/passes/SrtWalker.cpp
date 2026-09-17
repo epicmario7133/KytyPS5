@@ -712,7 +712,11 @@ private:
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 					return false;
 				}
-				result = m_runtime.user_data[reg - m_program.user_data_base];
+				const auto index = reg - m_program.user_data_base;
+				if (m_runtime.user_data_mask != nullptr && index < 64u) {
+					*m_runtime.user_data_mask |= uint64_t {1} << index;
+				}
+				result = m_runtime.user_data[index];
 				return true;
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;

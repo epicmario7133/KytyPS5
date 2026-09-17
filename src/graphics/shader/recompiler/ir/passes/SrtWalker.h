@@ -17,6 +17,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// When set, receives a bit per user-data dword the walk consumed.
+	uint64_t*                 user_data_mask             = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

@@ -276,18 +276,42 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
 		// Snapshots by user-data content: the same objects are drawn every frame with the same
-		// SRT pointers, so most draws replay a previous walk.
+		// SRT pointers, so most draws replay a previous walk. Only the user-data dwords a walk
+		// consumed take part in the key (per-draw constants in the other registers do not change
+		// the walk); the mask is the union over all walks and clears the memos when it grows.
 		static constexpr size_t                   MemoLimit = 512;
 		std::unordered_map<uint64_t, SnapshotMemo> memos;
+		uint64_t                                   user_data_mask = 0;
 	};
 
-	static uint64_t HashUserData(uint64_t shader_base, std::span<const uint32_t> user_data) {
+	static bool UserDataInMask(uint64_t mask, size_t index) {
+		return index >= 64u || (mask & (uint64_t {1} << index)) != 0;
+	}
+
+	static uint64_t HashUserData(uint64_t shader_base, std::span<const uint32_t> user_data,
+	                             uint64_t mask) {
 		uint64_t hash = shader_base * 0x9E3779B97F4A7C15ull;
-		for (const auto word: user_data) {
-			hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+		for (size_t index = 0; index < user_data.size(); index++) {
+			if (!UserDataInMask(mask, index)) {
+				continue;
+			}
+			hash = (hash ^ user_data[index]) * 0x9E3779B97F4A7C15ull;
 			hash ^= hash >> 31u;
 		}
 		return hash;
+	}
+
+	static bool SameMaskedUserData(std::span<const uint32_t> a, std::span<const uint32_t> b,
+	                               uint64_t mask) {
+		if (a.size() != b.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < a.size(); index++) {
+			if (UserDataInMask(mask, index) && a[index] != b[index]) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	struct ProgramKeyHash {
@@ -378,41 +402,50 @@ struct PipelineCache::ProgramCache {
 		};
 		if (entry != programs.end()) {
 			auto&      memos    = entry->second.memos;
-			const auto memo_key = HashUserData(params.Base(), params.user_data);
+			auto       mask     = entry->second.user_data_mask;
+			const auto memo_key = HashUserData(params.Base(), params.user_data, mask);
 			if (memos.size() >= SourceEntry::MemoLimit) {
 				memos.clear();
 			}
-			auto&      memo = memos[memo_key];
-			const bool same_inputs =
-			    memo.valid && memo.shader_base == params.Base() &&
-			    std::equal(memo.user_data.begin(), memo.user_data.end(),
-			               params.user_data.begin(), params.user_data.end());
 			static const bool memo_disabled = std::getenv("KYTY_NO_SRT_MEMO") != nullptr;
 			bool              memo_hit      = false;
+			auto              memo          = memos.find(memo_key);
 			{
 				KYTY_PROFILER_BLOCK("Programs::MemoCheck");
-				memo_hit = !memo_disabled && same_inputs && SrtReadsUnchanged(memo.reads);
+				memo_hit = !memo_disabled && memo != memos.end() && memo->second.valid &&
+				           memo->second.shader_base == params.Base() &&
+				           SameMaskedUserData(memo->second.user_data, params.user_data, mask) &&
+				           SrtReadsUnchanged(memo->second.reads);
 			}
 			if (memo_hit) {
 				KYTY_PROFILER_BLOCK("Programs::MemoHit");
-				resources      = memo.resources;
-				specialization = memo.specialization;
+				resources      = memo->second.resources;
+				specialization = memo->second.specialization;
+				resources.user_data.assign(params.user_data.begin(), params.user_data.end());
 			} else {
 				KYTY_PROFILER_BLOCK("Programs::Materialize");
 				SrtRecorder recorder;
-				auto        recording_runtime                       = runtime;
-				recording_runtime.userdata                          = &recorder;
-				recording_runtime.read_memory                       = RecordShaderSrtMemory;
-				recording_runtime.read_specialization_memory        = RecordShaderGuestMemory;
+				uint64_t    walk_mask                                = 0;
+				auto        recording_runtime                        = runtime;
+				recording_runtime.userdata                           = &recorder;
+				recording_runtime.read_memory                        = RecordShaderSrtMemory;
+				recording_runtime.read_specialization_memory         = RecordShaderGuestMemory;
+				recording_runtime.user_data_mask                     = &walk_mask;
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 				    entry->second.resource_plan, recording_runtime, resources, specialization));
-				memo.valid = !recorder.overflow;
-				if (memo.valid) {
-					memo.shader_base = params.Base();
-					memo.user_data.assign(params.user_data.begin(), params.user_data.end());
-					memo.reads          = std::move(recorder.reads);
-					memo.resources      = resources;
-					memo.specialization = specialization;
+				if ((walk_mask | mask) != mask) {
+					mask                        = walk_mask | mask;
+					entry->second.user_data_mask = mask;
+					memos.clear();
+				}
+				auto& stored = memos[HashUserData(params.Base(), params.user_data, mask)];
+				stored.valid = !recorder.overflow;
+				if (stored.valid) {
+					stored.shader_base = params.Base();
+					stored.user_data.assign(params.user_data.begin(), params.user_data.end());
+					stored.reads          = std::move(recorder.reads);
+					stored.resources      = resources;
+					stored.specialization = specialization;
 				}
 			}
 			KYTY_PROFILER_BLOCK("Programs::Permutation");
