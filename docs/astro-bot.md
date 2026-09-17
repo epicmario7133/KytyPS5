@@ -8,8 +8,8 @@ This fork exists for one purpose: getting **Astro Bot** running on KytyPS5. Ever
 - The game boots, plays the intro, reaches the title screen and the main menu, and a new save
   can be started.
 - Rendering is complete (full frame, ray-traced lighting, UI).
-- Still to do: a few materials render incorrectly, and the frame rate is low (roughly 25–30 fps
-  on an RTX 3070 Ti / i7-11700K at the game's dynamic resolution).
+- Still to do: a few materials render incorrectly, and the frame rate is low (roughly 5–30 fps
+  depending on the scene on an RTX 3070 Ti / i7-11700K; see the performance notes below).
 
 ## What was fixed, in the order it was found
 
@@ -43,6 +43,36 @@ This fork exists for one purpose: getting **Astro Bot** running on KytyPS5. Ever
    tiles as sky, and the tile lighting never rewrote them, leaving old frame content behind.
    When the pass would not cover the whole depth image, the image is now cleared explicitly.
 
+10. **Device memory exhaustion** — the game streams more textures than an 8 GB card holds;
+    `vkCreateImage` failed fatally after a few minutes of the intro. Image creation now evicts
+    least-recently-used textures and retries, and the garbage collector sweeps in bulk above the
+    driver's reported budget.
+11. **Per-frame GPU drains** — every CPU read of GPU-written memory submits and waits for the
+    whole queue. The `DISPATCH_INDIRECT` snapshot read, the DCC clear-key fills (executed as
+    compute, then read back on the next bind) and the game's own per-frame readbacks each cost a
+    drain; those are now read without faulting, written on the host, and batched respectively.
+    Non-mesh `DRAW_INDIRECT` is issued with `vkCmdDrawIndirect` instead of reading the arguments.
+
+## Performance notes (2026-09-17)
+
+Measured with Tracy (`--profile`, `tracy-capture` / `tracy-csvexport`) during the intro
+cutscene on the RTX 3070 Ti / i7-11700K:
+
+- The emulator is **CPU-bound on the GPU thread**: it spends ~99% of its time in
+  `CommandProcessor::Process`, the host GPU is not the limit. Making every ray miss
+  (`KYTY_DEBUG_SKIP_BVH=1`) does not change the frame rate.
+- 600–800 draws per frame at ~70 µs of host work each: `RebindImages` (~17 µs per stage),
+  program-cache lookup with SRT materialization (~22 µs), the remaining binding/pipeline work.
+- One mesh-shader `DRAW_INDIRECT` per frame whose arguments are written by a GPU culling pass:
+  reading them costs a full queue drain (10–28 ms per frame in heavy scenes). A GPU-side path
+  needs the mesh workgroup count and the index pointer derived on the GPU (small conversion
+  compute shader + reading the draw data from a buffer instead of push constants).
+- Blocking waits are reported by `KYTY_DEBUG_MEM_STATS=1` (`drains=` is the number of full
+  queue drains).
+
+Two emulator instances on the same machine (for example running the game while a test run is
+in progress) share VRAM and the GPU and make loading look stuck; test one at a time.
+
 ## Debugging aids that were kept
 
 Environment variables (all off by default):
@@ -55,6 +85,9 @@ Environment variables (all off by default):
 | `KYTY_DEBUG_LOOP_LIMIT=N` | SPIR-V loop watchdog: a shader returns after N loop iterations in total (diagnostic only, breaks rendering). |
 | `KYTY_DEBUG_DRAW_TARGET=<hex>` / `=1` | With `--graphics-debug-dump true`: log `DrawTargetState` for draws into that color target (or all draws). |
 | `KYTY_DEBUG_DRAW_PS=<hex hash>` | Same, for draws using that pixel shader. |
+| `KYTY_DEBUG_MEM_STATS=1` | Periodic line with device memory use, cache population, GPU-thread time split, blocking waits, drains, readbacks. |
+| `KYTY_DEBUG_READBACK_TRACE=1` | Sampled log of the CPU reads that force a GPU drain (address, window). |
+| `KYTY_DEBUG_SKIP_BVH=1` | Every ray query misses (profiling aid; lighting goes flat). |
 
 Useful CLI switches: `--shader-validation true` (spirv-val), `--shader-log-direction File`
 (RDNA2 disassembly and IR in the printf log), `--graphics-debug-dump true --shader-log-folder DIR`
