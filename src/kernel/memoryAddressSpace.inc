@@ -104,6 +104,7 @@ public:
 		for (const auto& [_, entry]: m_maps) {
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
+		m_generation.fetch_add(1, std::memory_order_release);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
@@ -116,6 +117,7 @@ public:
 			EXIT_IF(
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
+		m_generation.fetch_add(1, std::memory_order_release);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
@@ -180,6 +182,30 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr) {
 			return false;
+		}
+		// Small reads (SRT walks issue ~50 per draw) hit a per-thread cache of the last
+		// mapping so they skip the lock and the map lookup; any map change invalidates it.
+		auto&      cache      = t_read_cache;
+		const auto generation = m_generation.load(std::memory_order_acquire);
+		if (cache.store == this && cache.generation == generation && vaddr >= cache.vaddr &&
+		    size <= cache.size && vaddr - cache.vaddr <= cache.size - size) {
+			std::memcpy(data, m_backing_base + cache.backing_offset + (vaddr - cache.vaddr), size);
+			return true;
+		}
+		if (IsAvailable() && size != 0 && UINT64_MAX - vaddr >= size) {
+			std::lock_guard lock(m_mutex);
+			MapEntry        entry {};
+			if (FindContainingUnlocked(vaddr, size, &entry) &&
+			    RangeOk(entry.backing_offset, entry.size)) {
+				cache.store          = this;
+				cache.generation     = m_generation.load(std::memory_order_acquire);
+				cache.vaddr          = entry.vaddr;
+				cache.size           = entry.size;
+				cache.backing_offset = entry.backing_offset;
+				std::memcpy(data, m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+				            size);
+				return true;
+			}
 		}
 		auto* destination = static_cast<uint8_t*>(data);
 		return TryTransferBacking(
@@ -246,6 +272,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation.fetch_add(1, std::memory_order_release);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -257,6 +284,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation.fetch_add(1, std::memory_order_release);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -347,6 +375,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					m_generation.fetch_add(1, std::memory_order_release);
 					m_maps.erase(entry);
 #endif
 				}
@@ -369,6 +398,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_generation.fetch_add(1, std::memory_order_release);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -417,6 +447,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_release);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -427,12 +458,15 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_release);
 		m_maps.erase(old.vaddr);
 		if (left_size != 0) {
+			m_generation.fetch_add(1, std::memory_order_release);
 			m_maps.emplace(old.vaddr,
 			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
 		}
 		if (right_size != 0) {
+			m_generation.fetch_add(1, std::memory_order_release);
 			m_maps.emplace(right_addr,
 			               MapEntry {right_addr, right_size,
 			                         old.backing_offset + right_addr - old.vaddr, old.mode});
@@ -634,11 +668,23 @@ private:
 	int m_fd = -1;
 #endif
 
+	struct ReadCache {
+		const void* store          = nullptr;
+		uint64_t    generation     = 0;
+		uint64_t    vaddr          = 0;
+		uint64_t    size           = 0;
+		uint64_t    backing_offset = 0;
+	};
+	static thread_local ReadCache t_read_cache;
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	std::atomic<uint64_t>        m_generation {1};
 };
+
+thread_local GuestBackingStore::ReadCache GuestBackingStore::t_read_cache;
 
 class GuestAddressSpace {
 public:
