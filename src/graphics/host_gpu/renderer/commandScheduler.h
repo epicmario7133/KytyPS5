@@ -43,6 +43,10 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	// Diagnostics: waits that had to submit the command buffer being recorded.
+	[[nodiscard]] uint64_t DrainCount() const noexcept { return m_drain_count; }
+	[[nodiscard]] uint64_t StreamWaitCount() const noexcept { return m_stream_wait_count; }
+	void                   CountStreamWait() noexcept { m_stream_wait_count++; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -52,6 +56,9 @@ public:
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
+	uint64_t m_drain_count       = 0;
+	uint64_t m_stream_wait_count = 0;
+
 	class CommandPool {
 	public:
 		CommandPool(GraphicContext& graphics, MasterSemaphore& master);

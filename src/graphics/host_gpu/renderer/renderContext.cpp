@@ -7,6 +7,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -134,6 +136,25 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+
+	// KYTY_DEBUG_MEM_STATS=1: log device memory use and cache population every 256 runs.
+	static const bool mem_stats = std::getenv("KYTY_DEBUG_MEM_STATS") != nullptr;
+	static uint32_t   mem_stats_tick = 0;
+	if (mem_stats && (mem_stats_tick++ % 256) == 0) {
+		const auto [image_bytes, image_count]   = m_texture_cache.MemoryStats();
+		const auto [buffer_bytes, buffer_count] = m_buffer_cache.MemoryStats();
+		const auto& master                      = m_command_scheduler.GetMasterSemaphore();
+		LOGF("MemStats: frame=%d device=%" PRIu64 " MiB budget=%" PRIu64 " MiB images=%zu (%" PRIu64
+		     " MiB) buffers=%zu (%" PRIu64 " MiB) ticks=%" PRIu64 " waits=%" PRIu64 " (%" PRIu64
+		     " ms) drains=%" PRIu64 " stream_waits=%" PRIu64 " readbacks=%" PRIu64
+		     " downloads=%" PRIu64 "\n",
+		     m_gpu != nullptr ? m_gpu->GetFrameNum() : -1, m_graphics.GetDeviceMemoryUsage() >> 20,
+		     m_graphics.GetTotalMemoryBudget() >> 20, image_count, image_bytes >> 20, buffer_count,
+		     buffer_bytes >> 20, m_command_scheduler.CurrentTick(), master.BlockingWaits(),
+		     master.BlockingWaitNanoseconds() / 1000000, m_command_scheduler.DrainCount(),
+		     m_command_scheduler.StreamWaitCount(), m_buffer_cache.ReadbackCount(),
+		     m_texture_cache.DownloadCount());
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

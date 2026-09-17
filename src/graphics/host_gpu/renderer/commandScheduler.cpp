@@ -202,6 +202,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
+		m_drain_count++;
 		m_master.Wait(tick);
 		BeginNext();
 	} else {

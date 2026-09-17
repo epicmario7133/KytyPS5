@@ -1,7 +1,10 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -49,8 +52,17 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	const auto start  = std::chrono::steady_clock::now();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (!GuestGpu::IsGpuThread()) {
+		Refresh();
+		return;
+	}
+	m_blocking_waits++;
+	m_blocking_wait_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+	        .count());
 	Refresh();
 }
 

@@ -30,12 +30,17 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Diagnostics: blocking host waits on the GPU and the time spent in them.
+	[[nodiscard]] uint64_t BlockingWaits() const noexcept { return m_blocking_waits; }
+	[[nodiscard]] uint64_t BlockingWaitNanoseconds() const noexcept { return m_blocking_wait_ns; }
 
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	uint64_t              m_blocking_waits   = 0;
+	uint64_t              m_blocking_wait_ns = 0;
 };
 
 } // namespace Libs::Graphics
