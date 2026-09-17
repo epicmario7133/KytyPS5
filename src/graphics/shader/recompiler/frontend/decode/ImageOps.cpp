@@ -234,8 +234,18 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
+}
+
+// image_bvh_intersect_ray carries the node pointer (one or two dwords), the ray extent, the
+// origin and, unless A16 packs the direction pair into halves, the direction and inverse
+// direction as plain floats.
+constexpr uint32_t BvhAddressComponents(uint32_t opcode, bool a16) {
+	const uint32_t node_dwords = opcode == 0xe7u ? 2u : 1u;
+	return node_dwords + 1u + 3u + (a16 ? 3u : 6u);
 }
 
 uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInfo* gather) {
@@ -248,7 +258,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 	return 0;
 }
 
-uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
+uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension, bool a16,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
                                      const Detail::OpcodeMap* atomic) {
 	if (sample != nullptr) {
@@ -263,6 +273,8 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 
 	switch (opcode) {
 		case 0x0eu: return 1u;
+		case 0xe6u:
+		case 0xe7u: return BvhAddressComponents(opcode, a16);
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
@@ -358,7 +370,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, a16, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

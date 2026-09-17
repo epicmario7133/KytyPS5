@@ -1,5 +1,5 @@
-#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <array>
@@ -637,6 +637,66 @@ bool Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 	return true;
 }
 
+bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	auto memory = MemoryInfoFromDecoded(inst);
+	// The BVH descriptor is a 128-bit V#-like resource: base_address[39:0] in 256-byte units,
+	// box sort/grow controls in dword 1, the node count in dwords 2..3 and the triangle
+	// return mode in dword 3. Only the base address is resolved here; the rest travels raw.
+	const auto dword0   = GetResourceDword(memory.resource, 0);
+	const auto dword1   = GetResourceDword(memory.resource, 1);
+	const auto dword2   = GetResourceDword(memory.resource, 2);
+	const auto dword3   = GetResourceDword(memory.resource, 3);
+	const auto base_low = ir.Emit(IR::ValueOpcode::ShiftLeftLogical32, {dword0, IR::Value(8u)});
+	const auto base_high =
+	    ir.Emit(IR::ValueOpcode::BitwiseOr32,
+	            {ir.Emit(IR::ValueOpcode::ShiftRightLogical32, {dword0, IR::Value(24u)}),
+	             ir.Emit(IR::ValueOpcode::ShiftLeftLogical32,
+	                     {ir.Emit(IR::ValueOpcode::BitwiseAnd32, {dword1, IR::Value(0xffu)}),
+	                      IR::Value(8u)})});
+	const auto resource = GetAddressResource(base_low, base_high);
+
+	// Node pointer, ray extent, origin, direction and inverse direction as raw dwords; A16
+	// packs the two direction triples into three dwords of halves.
+	std::array<IR::Value, 13> components {};
+	components.fill(IR::Value(0u));
+	const auto count = inst.image_address_components;
+	EXIT_IF(count > components.size());
+	const auto nsa_components =
+	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
+	const auto base = MemorySourceAt(inst, 0);
+	for (uint32_t index = 0; index < count; index++) {
+		if (index != 0u && index - 1u < nsa_components) {
+			components[index] =
+			    ir.GetVectorReg(static_cast<IR::VectorReg>(inst.image_nsa_addr[index - 1u]));
+		} else {
+			components[index] = ReadRawU32(OffsetOperand(PlainOperand(base), index));
+		}
+	}
+	const auto address =
+	    ir.Emit(IR::ValueOpcode::MakeImageAddress,
+	            {components[0], components[1], components[2], components[3], components[4],
+	             components[5], components[6], components[7], components[8], components[9],
+	             components[10], components[11], components[12]});
+
+	memory.kind            = IR::ResourceKind::Global;
+	memory.resource        = 0;
+	memory.sampler         = 0;
+	memory.offset          = 0;
+	memory.data_dwords     = 1u;
+	memory.data_bits       = 32u;
+	memory.component_index = 0;
+	memory.component_count = 1u;
+	memory.address_is_full = false;
+	const auto result      = ir.Emit(IR::ValueOpcode::BvhIntersectRay,
+	                                 {resource, address, dword1, dword2, dword3, ir.GetExec()},
+	                                 AddMemoryInfo(memory, inst.pc));
+	for (uint32_t index = 0; index < 4u; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index),
+		             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(index)}));
+	}
+	return true;
+}
+
 bool Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
@@ -1042,6 +1102,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_MINMAX_F32(inst, IR::ValueOpcode::SharedAtomicFMin32);

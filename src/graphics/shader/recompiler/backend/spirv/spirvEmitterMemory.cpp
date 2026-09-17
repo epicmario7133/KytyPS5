@@ -1,8 +1,8 @@
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
-#include "graphics/host_gpu/renderer/cache/bufferCache.h"
-
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -106,6 +106,8 @@ uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, ui
 	return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
 }
 
+} // namespace
+
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
 	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
 	                              static_cast<uint32_t>(value),
@@ -119,6 +121,8 @@ uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high
 	                           ConstantDeviceAddress(state, 32));
 	return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low64, high64);
 }
+
+namespace {
 
 uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto& state = ctx.state;
@@ -171,17 +175,17 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
-uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
-	auto&      state  = ctx.state;
+} // namespace
+
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), result,
 	                          state.bda_pointer_function, address);
 	return result;
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
-	auto&      state   = ctx.state;
-	const auto bda     = GetBdaPointer(ctx, address);
+uint32_t LoadBdaDword(EmitterState& state, uint32_t address) {
+	const auto bda = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantDeviceAddress(state, 0));
 	return EmitValueOrZeroIfCondition(state, present, [&]() {
@@ -196,6 +200,8 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
+namespace {
+
 uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
 	             uint32_t bits) {
 	auto&      state   = ctx.state;
@@ -204,7 +210,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
 		                            ConstantDeviceAddress(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned);
+		const auto first   = LoadBdaDword(state, aligned);
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
@@ -213,7 +219,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
 		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
+			return LoadBdaDword(state, Binary(state, spv::OpIAdd, TypeScalarU64(state), aligned,
 			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
 		});
 		const auto shift =
@@ -991,6 +997,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	}
 	const auto m0 = ctx.Arg(inst, 0);
+	// M0 = (base << 16) | size for GDS append/consume.
 	const auto base =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
 	const auto size =
@@ -1019,9 +1026,10 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
 	                                   EmitSubgroupLocalInvocationId(state), source_lane);
 	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
-	const auto m0_bounds =
-	    mem.kind == IR::ResourceKind::Gds
-	        ? Binary(state, spv::OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
+	// GDS appends only range-check against the storage; M0's size field is advisory and some
+	// titles leave it zero.
+	const auto m0_bounds = mem.kind == IR::ResourceKind::Gds
+	                           ? ConstantBool(state, true)
 	        : Binary(state, spv::OpULessThan, TypeBool(state),
 	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
 	const auto condition = AndCondition(
