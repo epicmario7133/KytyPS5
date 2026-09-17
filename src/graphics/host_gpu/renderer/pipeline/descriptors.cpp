@@ -127,7 +127,7 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset) {
+                    uint32_t slot, uint32_t& buffer_offset, uint64_t shader_hash = 0) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -151,6 +151,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		// KYTY_DEBUG_WATCH_ADDR: name the shader behind a watched write binding.
+		static const uint64_t watch = [] {
+			const char* value = std::getenv("KYTY_DEBUG_WATCH_ADDR");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		if (watch != 0 && address <= watch && watch < address + size) {
+			static uint64_t count = 0;
+			if ((count++ % 64) == 0) {
+				LOGF("WatchAddr: written by shader 0x%016" PRIx64 " stage=%u slot=%u\n", shader_hash,
+				     static_cast<uint32_t>(stage), slot);
+			}
+		}
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {
@@ -913,7 +925,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               buffer_offset, program.shader_hash));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
