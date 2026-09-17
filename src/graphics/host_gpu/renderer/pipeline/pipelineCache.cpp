@@ -580,11 +580,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
+	Profiler::ScopedBlock       phase_vertex(KYTY_PROFILER_SOURCE("Programs::PrepareVertex"));
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+	phase_vertex.End();
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
@@ -606,6 +608,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		KYTY_PROFILER_BLOCK("Programs::PreparePixel");
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 	}
 	if (context.GetClipControl().clip_disable) {
@@ -626,6 +629,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	KYTY_PROFILER_BLOCK("Programs::CacheGet");
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}

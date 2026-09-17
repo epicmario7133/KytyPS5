@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
 #include <functional>
 #include <vector>
 
@@ -552,6 +553,13 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto desc1 = ctx.Arg(inst, 2);
 	const auto desc3 = ctx.Arg(inst, 4);
 	const auto exec  = ctx.Arg(inst, 5);
+	// KYTY_DEBUG_SKIP_BVH=1: every ray misses (profiling aid; lighting goes flat).
+	static const bool skip_bvh = std::getenv("KYTY_DEBUG_SKIP_BVH") != nullptr;
+	if (skip_bvh) {
+		const auto miss = ConstantU32(state, 0xffffffffu);
+		return state.builder.Constant(spv::OpConstantComposite, TypeU32Vector(state, 4), miss, miss,
+		                              miss, miss);
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, exec, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&] {
 		    const auto result = state.builder.AllocateId();

@@ -69,6 +69,9 @@ struct Lifecycle {
 	Profiler::ScopedBlock KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                        \
 	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
 
+// A named source location for a manually scoped Profiler::ScopedBlock.
+#define KYTY_PROFILER_SOURCE(name)                                                                 	([]() -> const tracy::SourceLocationData* {                                                    		static constexpr tracy::SourceLocationData location {name, TracyFunction, TracyFile,       		                                                     static_cast<uint32_t>(__LINE__), 0};   		return &location;                                                                          	}())
+
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_FUNCTION_IMPL(__LINE__ __VA_OPT__(, ) __VA_ARGS__)
 #define KYTY_PROFILER_FUNCTION_IMPL(line, ...)                                                     \
 	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \

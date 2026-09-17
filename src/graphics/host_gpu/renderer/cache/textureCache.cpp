@@ -1143,6 +1143,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
+	KYTY_PROFILER_FUNCTION();
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
@@ -1257,6 +1258,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");

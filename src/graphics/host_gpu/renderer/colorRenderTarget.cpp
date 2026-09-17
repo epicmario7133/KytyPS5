@@ -352,6 +352,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	KYTY_PROFILER_BLOCK("ColorTarget::FindImage");
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
