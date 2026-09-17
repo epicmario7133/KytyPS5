@@ -62,6 +62,10 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Flush requested by an end-of-pipe interrupt: submits at most every FlushIntervalNs so
+	// hundreds of interrupt events per frame do not become hundreds of queue submissions.
+	void            BufferFlushForInterrupt();
+	void            FlushPendingInterrupt();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -159,6 +163,10 @@ private:
 	HW::UserSgprType m_user_data_marker                 = HW::UserSgprType::Unknown;
 	uint32_t         m_index_type_and_size              = 0;
 	uint32_t         m_index_buffer_size                = 0;
+	uint64_t         m_barrier_work_serial              = UINT64_MAX;
+	bool             m_interrupt_flush_pending          = false;
+	int64_t          m_last_interrupt_flush_ns          = 0;
+	uint64_t         m_barrier_tick                     = 0;
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;

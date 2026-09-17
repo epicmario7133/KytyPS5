@@ -265,8 +265,42 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
+namespace {
+constexpr int64_t FlushIntervalNs = 300'000;
+int64_t           MonotonicNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+} // namespace
+
 void CommandProcessor::BufferFlush() {
+	m_interrupt_flush_pending = false;
+	m_last_interrupt_flush_ns = MonotonicNs();
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::BufferFlushForInterrupt() {
+	const auto now = MonotonicNs();
+	if (now - m_last_interrupt_flush_ns >= FlushIntervalNs) {
+		m_interrupt_flush_pending = false;
+		m_last_interrupt_flush_ns = now;
+		GetScheduler().Flush();
+		return;
+	}
+	m_interrupt_flush_pending = true;
+}
+
+void CommandProcessor::FlushPendingInterrupt() {
+	if (!m_interrupt_flush_pending) {
+		return;
+	}
+	const auto now = MonotonicNs();
+	if (now - m_last_interrupt_flush_ns >= FlushIntervalNs) {
+		m_interrupt_flush_pending = false;
+		m_last_interrupt_flush_ns = now;
+		GetScheduler().Flush();
+	}
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -890,6 +924,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
+	FlushPendingInterrupt();
 
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1121,6 +1156,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode,
                                       uint64_t indirect_args_addr) {
+	FlushPendingInterrupt();
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1204,6 +1240,7 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CheckBuffer();
+	FlushPendingInterrupt();
 
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
@@ -1478,6 +1515,14 @@ void CommandProcessor::EmitGlobalBarrier() {
 
 	Common::LockGuard lock(m_renderer.GetMutex());
 
+	// Titles emit hundreds of cache-flush events per frame; a second full barrier with no draw
+	// or dispatch recorded in between orders nothing new.
+	const auto serial = CurrentBuffer().WorkSerial();
+	const auto tick   = GetScheduler().CurrentTick();
+	if (serial == m_barrier_work_serial && tick == m_barrier_tick) {
+		return;
+	}
+
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
@@ -1489,6 +1534,8 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	m_barrier_work_serial = CurrentBuffer().WorkSerial();
+	m_barrier_tick        = tick;
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

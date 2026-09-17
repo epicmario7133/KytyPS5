@@ -24,6 +24,7 @@ bool CommandBuffer::IsInvalid() const {
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	m_work_serial++;
 	EXIT_IF(IsInvalid());
 	return m_buffer;
 }
