@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -2003,6 +2004,11 @@ Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 }
 Bool KYTY_SYSV_ABI AvPlayerIsActive(AvPlayerInternal* h) {
 	PRINT_NAME();
+	// KYTY_DEBUG_SKIP_VIDEO reports every clip as finished so intros do not delay debugging.
+	static const bool skip_video = std::getenv("KYTY_DEBUG_SKIP_VIDEO") != nullptr;
+	if (skip_video) {
+		return 0;
+	}
 	return h != nullptr && h->source != nullptr && h->source->Active() ? 1 : 0;
 }
 uint64_t KYTY_SYSV_ABI AvPlayerCurrentTime(AvPlayerInternal* h) {
