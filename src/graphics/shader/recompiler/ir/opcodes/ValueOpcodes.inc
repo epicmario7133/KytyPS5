@@ -284,6 +284,9 @@ VALUE_OPCODE(ImageAtomicUMax32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicAnd32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicOr32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicXor32, U32, ImageResource, ImageAddress, U32, U1)
+// Ray/BVH-node intersection over guest memory: BVH base address handle, node pointer and ray
+// (as an image address), descriptor dwords 1..3, and the exec mask.
+VALUE_OPCODE(BvhIntersectRay, U32x4, AddressResource, ImageAddress, U32, U32, U32, U1)
 VALUE_OPCODE(GetAttribute, U32, U32, U32)
 VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)

@@ -93,6 +93,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bvh_intersect_function       = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -112,6 +113,8 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                                         loop_watchdog_variable    = 0;
+	uint32_t                                         loop_watchdog_limit       = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -477,6 +480,15 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+
+// Guest 64-bit address helpers over the BDA page table (require program.info.uses_dma).
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t LoadBdaDword(EmitterState& state, uint32_t address);
+
+void     DefineBvhIntersectRay(EmitterState& state);
+uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
