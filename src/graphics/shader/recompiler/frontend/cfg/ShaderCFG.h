@@ -51,6 +51,9 @@ struct Terminator {
 	uint32_t              goto_variable = UINT32_MAX;
 	int32_t               goto_value    = -1;
 	bool                  loop_header   = false;
+	// A synthetic selection merge that no arm reaches; it only satisfies structured
+	// control flow and is expected to have no predecessors.
+	bool unreachable_merge = false;
 };
 
 struct BasicBlock {

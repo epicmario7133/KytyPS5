@@ -574,6 +574,16 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 			pending.push_back(block_indices.at(successor));
 		}
 	}
+	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
+		// Synthetic selection merges are unreachable by construction and carry no code.
+		const auto& info = program.block_info[block_index];
+		if (!reachable[block_index] && info.terminator.unreachable_merge &&
+		    info.terminator.kind == CFG::TerminatorKind::Return &&
+		    program.blocks[block_index]->ImmPredecessors().empty() &&
+		    program.blocks[block_index]->begin() == program.blocks[block_index]->end()) {
+			reachable[block_index] = true;
+		}
+	}
 	if (!std::ranges::all_of(reachable, [](bool value) { return value; })) {
 		return Fail("value IR contains an unreachable block");
 	}
