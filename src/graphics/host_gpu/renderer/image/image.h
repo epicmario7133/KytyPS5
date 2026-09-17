@@ -67,11 +67,12 @@ public:
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
+		const auto resident = info.ResidentRange();
+		if (ImageRangeOverlaps(resident.address, resident.size, vaddr, size)) {
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
+		} else if (ImagePageRangesOverlap(resident.address, resident.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 		}
 	}
@@ -123,8 +124,9 @@ public:
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
-		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
-		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+		const auto resident = info.ResidentRange();
+		return pages ? ImagePageRangesOverlap(resident.address, resident.size, address, size)
+		             : ImageRangeOverlaps(resident.address, resident.size, address, size);
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();

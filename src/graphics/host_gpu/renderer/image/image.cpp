@@ -706,7 +706,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
-	const auto                                 range = info.data;
+	const auto                                 range = info.ResidentRange();
 	const uint64_t head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
 	const uint64_t tail_begin =

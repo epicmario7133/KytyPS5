@@ -68,7 +68,15 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
+	// First mip backed by guest memory (T# min_lod): the bytes of the mips before it belong
+	// to other allocations and are neither tracked nor uploaded.
+	uint32_t                     resident_level  = 0;
+	uint64_t                     resident_offset = 0;
 	std::array<ImageMipInfo, 16> mip_layout {};
+
+	[[nodiscard]] constexpr GuestRange ResidentRange() const noexcept {
+		return {data.address + resident_offset, data.size - resident_offset};
+	}
 
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {

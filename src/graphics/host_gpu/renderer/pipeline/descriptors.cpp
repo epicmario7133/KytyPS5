@@ -444,6 +444,33 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 	}
 }
 
+// Mips below the T# minimum LOD of a streamed texture are not backed by guest memory: the
+// image only owns the bytes from the first resident mip (or the packed mip tail) onward.
+static void SetResidentLevel(ImageInfo& info, uint32_t min_level) {
+	static const bool disabled = std::getenv("KYTY_NO_RESIDENT_MIPS") != nullptr;
+	if (disabled || min_level == 0 || info.resources.levels <= 1 || info.resources.layers != 1 ||
+	    info.IsVolume() || info.IsDepth() || info.HasStencil() || info.HasMetadata() ||
+	    info.resources.levels > info.mip_layout.size()) {
+		return;
+	}
+	const auto level  = std::min(min_level, info.resources.levels - 1u);
+	uint64_t   offset = UINT64_MAX;
+	for (uint32_t mip = level; mip < info.resources.levels; mip++) {
+		offset = std::min(offset, info.mip_layout[mip].offset);
+	}
+	if (offset == 0 || offset >= info.data.size) {
+		return;
+	}
+	for (uint32_t mip = 0; mip < level; mip++) {
+		// A layout that keeps a lower mip past the resident cut is not sliceable.
+		if (info.mip_layout[mip].offset >= offset) {
+			return;
+		}
+	}
+	info.resident_level  = level;
+	info.resident_offset = offset;
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -533,6 +560,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (memo_disabled) {
 		return ResolveTextureUncached(resource, value);
 	}
+	KYTY_PROFILER_FUNCTION();
 	const TextureMemoKey key {&resource, value.dwords};
 	if (const auto found = m_texture_memo.find(key); found != m_texture_memo.end()) {
 		const auto& cached = found->second;
@@ -549,6 +577,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 		m_texture_memo.erase(found);
 	}
+	KYTY_PROFILER_BLOCK("Texture::ResolveMiss");
 	auto binding = ResolveTextureUncached(resource, value);
 	if (m_texture_memo.size() >= 8192) {
 		m_texture_memo.clear();
@@ -605,6 +634,14 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
 		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
 		     descriptor.fields[6], descriptor.fields[7]);
+	}
+	// KYTY_DEBUG_TEXTURE_TRACE=1: log the residency-related T# fields of mipmapped textures.
+	static const bool trace_textures = std::getenv("KYTY_DEBUG_TEXTURE_TRACE") != nullptr;
+	if (trace_textures && !multisampled && max_mip >= 4) {
+		LOGF("TextureTrace: addr=0x%010" PRIx64 " %ux%u fmt=%u base=%u last=%u max_mip=%u "
+		     "min_lod=%u\n",
+		     address, width, height, static_cast<uint32_t>(descriptor.Format()), base_level,
+		     last_level, max_mip, descriptor.MinLod());
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
@@ -700,6 +737,7 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 		desc.info.mip_layout[0] = {0, size.size, pitch, height};
 	} else {
 		PopulateTextureMipLayout(desc.info);
+		SetResidentLevel(desc.info, descriptor.MinLod() >> 8u);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
@@ -863,7 +901,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
-void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+bool RenderExecutor::ResolveStaleImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -871,6 +909,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	bool  changed       = false;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -881,8 +920,26 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+			changed = true;
 		}
 	}
+	return changed;
+}
+
+void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	// Resolving one image can replace or expand another one bound earlier in the same pass, so
+	// repeat until every binding survives a full pass.
+	for (uint32_t pass = 0; ResolveStaleImages(prepared); pass++) {
+		EXIT_IF(pass > 16);
+	}
+	AcquireImageViews(prepared);
+}
+
+void RenderExecutor::AcquireImageViews(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	const auto& program       = *prepared.runtime->program;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
@@ -922,23 +979,38 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
-	}
+	// Discovering one image (stage texture or colour target) can replace or expand another one
+	// already bound for this draw; repeat until all identities survive a full pass, then take
+	// the views.
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
-		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			target.desc.view_info.base_level = target.guest_mip_level;
-			target.desc.view_info.base_layer = target.guest_array_layer;
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
+	for (uint32_t pass = 0;; pass++) {
+		bool changed = false;
+		for (auto* stage: stages) {
+			changed |= ResolveStaleImages(*stage);
 		}
+		for (auto& target: colors) {
+			EXIT_IF(!target.image_id);
+			const auto old_image = cache.m_slot_images.try_get(target.image_id);
+			if (old_image == nullptr ||
+			    (!old_image->registered && !old_image->info.data.Empty()) ||
+			    old_image->binding.needs_rebind) {
+				if (old_image != nullptr) {
+					old_image->binding = {};
+				}
+				target.desc.view_info.base_level = target.guest_mip_level;
+				target.desc.view_info.base_layer = target.guest_array_layer;
+				target.image_id = cache.FindImage(target.desc);
+				BindRenderTarget(target.image_id);
+				changed = true;
+			}
+		}
+		if (!changed) {
+			break;
+		}
+		EXIT_IF(pass > 16);
+	}
+	for (auto* stage: stages) {
+		AcquireImageViews(*stage);
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.

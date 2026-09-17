@@ -289,11 +289,12 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
+	const auto                resident = image.info.ResidentRange();
 	ImagePageTable::PageRange pages {};
-	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+	if (!ImagePageTable::TryGetPageRange(resident.address, resident.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
+	ForEachPage(resident.address, resident.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
@@ -307,11 +308,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
+	const auto                resident = image.info.ResidentRange();
 	ImagePageTable::PageRange pages {};
-	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+	if (!ImagePageTable::TryGetPageRange(resident.address, resident.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
 	}
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
+	ForEachPage(resident.address, resident.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
@@ -390,15 +392,16 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	const auto image_begin = image.info.data.address;
-	const auto image_end   = image.info.data.End();
+	const auto resident    = image.info.ResidentRange();
+	const auto image_begin = resident.address;
+	const auto image_end   = resident.End();
 	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
 		return;
 	}
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
-		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		m_page_manager.UpdatePageWatchers<true>(image_begin, resident.size);
 		return;
 	}
 	if (image_begin < image.track_addr) {
@@ -414,7 +417,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	const auto image_begin = image.info.data.address;
+	const auto image_begin = image.info.ResidentRange().address;
 	if (image_begin == image.track_addr) {
 		return;
 	}
@@ -431,7 +434,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	const auto image_end = image.info.data.End();
+	const auto image_end = image.info.ResidentRange().End();
 	if (image_end == image.track_addr_end) {
 		return;
 	}
@@ -460,7 +463,7 @@ void TextureCache::UntrackImage(ImageId id) {
 
 void TextureCache::UntrackImageHead(ImageId id) {
 	auto&      image = m_slot_images[id];
-	const auto begin = image.info.data.address;
+	const auto begin = image.info.ResidentRange().address;
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
@@ -477,7 +480,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 
 void TextureCache::UntrackImageTail(ImageId id) {
 	auto&      image = m_slot_images[id];
-	const auto end   = image.info.data.End();
+	const auto end   = image.info.ResidentRange().End();
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
@@ -1090,9 +1093,42 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
+		const auto resident_size = info.data.size - info.resident_offset;
+		if (info.resident_offset != 0) {
+			// The source holds the resident range only; drop the mips before it.
+			if (!transfer.tiles.empty() && transfer.tiles.size() != transfer.regions.size()) {
+				EXIT("TextureCache: resident upload needs one tile per region\n");
+			}
+			std::vector<vk::BufferImageCopy> regions;
+			std::vector<GpuTileInfo>         tiles;
+			for (size_t index = 0; index < transfer.regions.size(); index++) {
+				const auto& region = transfer.regions[index];
+				if (region.imageSubresource.mipLevel < info.resident_level) {
+					continue;
+				}
+				if (transfer.tiles.empty()) {
+					auto copy = region;
+					if (copy.bufferOffset < info.resident_offset) {
+						EXIT("TextureCache: resident mip precedes the resident offset\n");
+					}
+					copy.bufferOffset -= info.resident_offset;
+					regions.push_back(copy);
+				} else {
+					auto tile = transfer.tiles[index];
+					if (tile.tiled_offset < info.resident_offset) {
+						EXIT("TextureCache: resident tile precedes the resident offset\n");
+					}
+					tile.tiled_offset -= info.resident_offset;
+					tiles.push_back(tile);
+					regions.push_back(region);
+				}
+			}
+			transfer.regions = std::move(regions);
+			transfer.tiles   = std::move(tiles);
+		}
+		TileManager::Result linear {source.Handle(), source_offset, resident_size};
 		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			linear = m_tiler.Detile(source.Handle(), source_offset, resident_size,
 			                        transfer.LinearSize(), transfer.tiles);
 		}
 		if (transfer.swap_bgra16) {
@@ -1160,8 +1196,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		const auto resident = image.info.ResidentRange();
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainBufferForImage(resident.address, resident.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1241,9 +1278,11 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	TrackImage(id);
 	auto& image = m_slot_images[id];
 	if (image.IsMaybeCpuDirty()) {
+		KYTY_PROFILER_BLOCK("Texture::HashGuestEdges");
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
@@ -1261,6 +1300,20 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
+	// KYTY_DEBUG_REFRESH_TRACE=1: log every guest re-upload of a registered image.
+	static const bool trace_refresh = std::getenv("KYTY_DEBUG_REFRESH_TRACE") != nullptr;
+	if (trace_refresh) {
+		LOGF("RefreshTrace: gc=%" PRIu64 " addr=0x%010" PRIx64 " size=0x%" PRIx64 " %ux%ux%u fmt=%u "
+		     "levels=%u tile=%u buffer=%d cpu=%d gpu=%d\n",
+		     m_gc_tick, image.info.data.address,
+		     image.info.data.size, image.info.extent.width, image.info.extent.height,
+		     image.info.extent.depth, static_cast<uint32_t>(image.info.pixel_format),
+		     image.info.resources.levels, static_cast<uint32_t>(image.info.tile_mode),
+		     static_cast<int>(image.IsBufferModified()),
+		     static_cast<int>(image.IsDefinitelyCpuDirty()),
+		     static_cast<int>(image.IsGpuModified()));
+	}
+	KYTY_PROFILER_BLOCK("Texture::RefreshUpload");
 	InitializeImage(id);
 }
 
@@ -1308,14 +1361,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		const auto       resident   = desc.info.ResidentRange();
+		const auto       candidates = FindImagesInRegion(resident.address, resident.size, false);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
+		}
+		if (result && desc.info.resident_offset < m_slot_images[result].info.resident_offset) {
+			ExtendResidency(result, desc.info);
 		}
 
 		int32_t view_mip   = -1;
@@ -1344,10 +1400,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
+			result              = InsertImage(desc.info);
+			auto&      inserted = m_slot_images[result];
+			const auto range    = inserted.info.ResidentRange();
+			if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
@@ -1373,6 +1429,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 	MaterializeDccClear(result, desc, metadata_base_layer);
 	return result;
+}
+
+// The guest streamed more mips into a texture (lower T# min_lod): own their memory and reload
+// the resident chain.
+void TextureCache::ExtendResidency(ImageId id, const ImageInfo& requested) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
+		return;
+	}
+	UnregisterImage(id);
+	image.info.resident_level  = requested.resident_level;
+	image.info.resident_offset = requested.resident_offset;
+	RegisterImage(id);
+	const auto resident = image.info.ResidentRange();
+	image.InvalidateCpuWrite(resident.address, resident.size);
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -1423,6 +1494,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1823,7 +1895,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id) {
+	// A partially resident chain cannot be written back: the bytes before its resident mip
+	// belong to other allocations.
+	if (image.depth_id || image.info.resident_offset != 0) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
@@ -1911,8 +1985,9 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			UntrackImage(id);
 			continue;
 		}
-		const auto image_begin = owner->info.data.address;
-		const auto image_end   = owner->info.data.End();
+		const auto resident    = owner->info.ResidentRange();
+		const auto image_begin = resident.address;
+		const auto image_end   = resident.End();
 		if (page_end < image_end) {
 			UntrackImageHead(id);
 		} else if (image_begin < page_begin) {
@@ -2031,8 +2106,11 @@ bool TextureCache::ReclaimMemory(uint64_t bytes) {
 	// Deletions are deferred until the GPU is done with the images; drain now so the memory
 	// is actually returned before the retry.
 	const auto tick = m_scheduler.CurrentTick();
-	m_scheduler.Wait(tick);
-	m_scheduler.WaitPriorityOperations(tick);
+	{
+		KYTY_PROFILER_BLOCK("Wait::ReclaimMemory");
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
 	m_scheduler.PopPendingOperations();
 	LOGF("TextureCache: device memory exhausted, evicted %zu images (%" PRIu64 " MiB) for a %" PRIu64
 	     " MiB allocation\n",
