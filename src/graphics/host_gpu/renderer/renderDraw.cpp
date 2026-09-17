@@ -35,6 +35,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -185,8 +186,21 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 		return;
 	}
 
-	auto log_id = g_draw_state_log_count.fetch_add(1);
-	if (log_id >= 192) {
+	// KYTY_DEBUG_DRAW_TARGET=<hex address, or 1 for all>: keep logging draws into that target.
+	static const uint64_t traced_target = [] {
+		const char* value = std::getenv("KYTY_DEBUG_DRAW_TARGET");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+	}();
+	// KYTY_DEBUG_DRAW_PS=<hex hash>: same, for draws using that pixel shader.
+	static const uint64_t traced_ps = [] {
+		const char* value = std::getenv("KYTY_DEBUG_DRAW_PS");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t {0};
+	}();
+	const bool traced = traced_target == 1 ||
+	                    (traced_target != 0 && color.desc.info.data.address == traced_target) ||
+	                    (traced_ps != 0 && ps_input_info.stage.program->shader_hash == traced_ps);
+	auto       log_id = g_draw_state_log_count.fetch_add(1);
+	if (log_id >= 192 && !(traced && log_id < 4096)) {
 		return;
 	}
 
@@ -205,16 +219,18 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	const auto sc     = calc_final_scissor(vp, ctx.GetScanModeControl(), extent, 0);
 
 	LOGF(
-	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64
-	    " extent=%ux%u prim=%u index_count=%u flags=0x%08" PRIx32 " color_mask=0x%08" PRIx32
+	    "DrawTargetState[%u]: frame=%d %s target=%s addr=0x%010" PRIx64 " ps=0x%016" PRIx64
+	    " extent=%ux%u depth=0x%010" PRIx64 "/%ux%u prim=%u index_count=%u flags=0x%08" PRIx32
+	    " color_mask=0x%08" PRIx32
 	    " cc_mode=%u cc_op=0x%02x"
 	    " blend=%s src=%u dst=%u comb=%u ps_tex=%d sampled=%d storage=%d ps_kill=%s target_mode0=%u"
 	    " depth_test=%s depth_write=%s depth_func=%u depth_clear=%s viewport=(%.1f,%.1f %.1fx%.1f) "
 	    "scissor=(%d,%d)-(%d,%d)\n",
 	    log_id, buffer.GetContext().GetGpu().GetFrameNum(), draw_name, RenderColorTypeName(color),
-	    color.desc.info.data.address, extent.width, extent.height,
-	    static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags, ctx.GetRenderTargetMask(),
-	    cc.mode, cc.op,
+	    color.desc.info.data.address, ps_input_info.stage.program->shader_hash, extent.width,
+	    extent.height, depth.desc.info.data.address, depth.desc.info.extent.width,
+	    depth.desc.info.extent.height, static_cast<uint32_t>(ucfg.GetPrimType()), index_count,
+	    flags, ctx.GetRenderTargetMask(), cc.mode, cc.op,
 	    bc.enable ? "true" : "false", bc.color_srcblend, bc.color_destblend, bc.color_comb_fcn,
 	    static_cast<int>(ps_resources.images.size()), static_cast<int>(sampled_images),
 	    static_cast<int>(ps_resources.images.size() - sampled_images),
@@ -224,6 +240,18 @@ static void LogDrawTargetState(const char* draw_name, const RenderColorInfo& col
 	    vp0.yoffset - vp0.yscale, vp0.xscale * 2.0f, vp0.yscale * 2.0f, sc.left, sc.top, sc.right,
 	    sc.bottom);
 
+	if (traced) {
+		const auto& resources = ps_input_info.stage.resources;
+		for (uint32_t i = 0; i < ps_resources.images.size() && i < resources.images.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			LOGF("  PS texture[%u]: addr=0x%010" PRIx64 " type=%u fmt=%u extent=%ux%u depth=%u "
+			     "levels=%u tile=%u\n",
+			     i, r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
+			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+			     static_cast<uint32_t>(r.Depth()) + 1u, static_cast<uint32_t>(r.LastLevel()) + 1u,
+			     static_cast<uint32_t>(r.TileMode()));
+		}
+	}
 	LogMrtState(draw_name, buffer, ps_input_info);
 }
 
@@ -534,12 +562,33 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+		auto& image = cache.GetImage(depth.image_id);
+		// An HTile clear covers the whole depth surface. The attachment load clear only covers
+		// the render area, which the color targets can shrink (a smaller target bound with a
+		// stale depth target), so clear the image directly when the pass would not reach all
+		// of it.
+		bool load_meta_clear = meta_clear;
+		if (meta_clear && !depth.depth_clear_enable) {
+			const auto& view       = depth.desc.view_info;
+			const auto  mip_width  = std::max(image.info.extent.width >> view.base_level, 1u);
+			const auto  mip_height = std::max(image.info.extent.height >> view.base_level, 1u);
+			if (std::min(state.width, depth.desc.info.extent.width) < mip_width ||
+			    std::min(state.height, depth.desc.info.extent.height) < mip_height) {
+				vk::ClearValue clear {};
+				clear.depthStencil.depth = depth.depth_clear_value;
+				std::scoped_lock lock {cache.m_lock};
+				cache.ClearImage(buffer, depth.image_id, image.backing.format,
+				                 {vk::ImageAspectFlagBits::eDepth, view.base_level,
+				                  view.level_count, view.base_layer, view.layer_count},
+				                 clear);
+				load_meta_clear = false;
+			}
+		}
+		depth.depth_load_clear_enable = depth.depth_clear_enable || load_meta_clear;
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
-		auto& image = cache.GetImage(depth.image_id);
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     image.info.data.address, image.info.data.size,
@@ -1005,7 +1054,9 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	}
 
 	if (!draw.IsIndexed() &&
-	    buffer.GetUserConfig().GetPrimType() != Prospero::PrimitiveType::kRectListLegacy) {
+	    buffer.GetUserConfig().GetPrimType() != Prospero::PrimitiveType::kRectListLegacy &&
+	    std::getenv("KYTY_DEBUG_DRAW_TARGET") == nullptr &&
+	    std::getenv("KYTY_DEBUG_DRAW_PS") == nullptr) {
 		return;
 	}
 
