@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -400,6 +402,12 @@ private:
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
+		// A raw read that depends on loop-variant state (an instance pointer while walking an
+		// acceleration structure, for instance) cannot be evaluated on the host; it stays a
+		// GPU load and only address handles may consume it.
+		if (!ValidateRuntimeValue(m_program, value)) {
+			return;
+		}
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
@@ -519,6 +527,12 @@ private:
 		const bool evaluated = EvaluateInst(*inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
+			if (m_visiting.empty()) {
+				std::fprintf(stderr, "shader SRT evaluation: hash=0x%016llx cannot evaluate %.*s\n",
+				             static_cast<unsigned long long>(m_program.shader_hash),
+				             static_cast<int>(ValueOpcodeName(inst->GetOpcode()).size()),
+				             ValueOpcodeName(inst->GetOpcode()).data());
+			}
 			return false;
 		}
 		m_cache.emplace(inst, out);
@@ -1076,11 +1090,106 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
+namespace {
+
+uint64_t PackMemoryFlags(MemoryFlags flags) {
+	uint64_t bits = 0;
+	std::memcpy(&bits, &flags, sizeof(flags));
+	return bits;
+}
+
+// Scalar buffer reads whose V# cannot be materialized at pipeline creation (for example a
+// descriptor assembled from a loop-variant pointer while walking an acceleration structure)
+// are lowered to raw guest-address loads with the V# range check folded into the predicate.
+void LowerDynamicScalarBufferReads(Program& program) {
+	struct Candidate {
+		Block* block = nullptr;
+		Inst*  read  = nullptr;
+	};
+	std::vector<Candidate>          candidates;
+	std::unordered_map<Inst*, bool> handle_static;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer || inst.NumArgs() != 2u ||
+			    !IsRawRead(program, inst)) {
+				continue;
+			}
+			auto* handle = inst.Arg(0).ResolveInstruction();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    handle->NumArgs() != 4u) {
+				continue;
+			}
+			auto found = handle_static.find(handle);
+			if (found == handle_static.end()) {
+				bool valid = true;
+				for (size_t index = 0; index < handle->NumArgs() && valid; index++) {
+					valid = ValidateRuntimeValue(program, handle->Arg(index));
+				}
+				found = handle_static.emplace(handle, valid).first;
+			}
+			if (!found->second) {
+				candidates.push_back({block, &inst});
+			}
+		}
+	}
+	for (const auto& candidate: candidates) {
+		auto&      list = candidate.block->Instructions();
+		auto*      read = candidate.read;
+		const auto where =
+		    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == read; });
+		const auto  flags  = read->Flags<MemoryFlags>();
+		const auto* handle = read->Arg(0).ResolveInstruction();
+		const auto  emit   = [&](ValueOpcode opcode, std::initializer_list<Value> args,
+		                         uint64_t bits = 0) {
+			return Value(&*candidate.block->PrependNewInst(where, opcode, args, bits));
+		};
+		const auto dword0    = handle->Arg(0);
+		const auto dword1    = handle->Arg(1);
+		const auto dword2    = handle->Arg(2);
+		const auto base_high = emit(ValueOpcode::BitwiseAnd32, {dword1, Value(0xffffu)});
+		const auto stride   = emit(ValueOpcode::BitFieldUExtract, {dword1, Value(16u), Value(14u)});
+		const auto resource = emit(ValueOpcode::GetAddressResource, {dword0, base_high});
+		// Raw V# range: num_records bytes with stride 0, otherwise stride * num_records.
+		const auto unstrided = emit(ValueOpcode::IEqual32, {stride, Value(0u)});
+		const auto size_low =
+		    emit(ValueOpcode::SelectU32,
+		         {unstrided, dword2, emit(ValueOpcode::IMul32, {dword2, stride})});
+		const auto size_high =
+		    emit(ValueOpcode::SelectU32,
+		         {unstrided, Value(0u), emit(ValueOpcode::UMulHi, {dword2, stride})});
+		auto       memory = program.memory_info.at(flags.index);
+		const auto end    = emit(ValueOpcode::IAdd32, {read->Arg(1), Value(memory.offset + 3u)});
+		const auto in_bounds =
+		    emit(ValueOpcode::LogicalOr, {emit(ValueOpcode::INotEqual32, {size_high, Value(0u)}),
+		                                  emit(ValueOpcode::ULessThan32, {end, size_low})});
+		memory.kind            = ResourceKind::ScalarAddress;
+		memory.resource        = 0;
+		memory.sampler         = 0;
+		memory.address_is_full = false;
+		memory.planning_only   = false;
+		memory.typed           = false;
+		memory.formatted       = false;
+		const auto index       = static_cast<uint32_t>(program.memory_info.size());
+		program.memory_info.push_back(memory);
+		const auto load =
+		    emit(ValueOpcode::LoadAddressU32, {resource, read->Arg(1), Value(0u), in_bounds},
+		         PackMemoryFlags({.index = index, .pc = flags.pc}));
+		read->ReplaceUsesWith(load);
+	}
+	if (!candidates.empty()) {
+		std::fprintf(stderr, "shader SRT: hash=0x%016llx lowered %zu dynamic scalar buffer reads\n",
+		             static_cast<unsigned long long>(program.shader_hash), candidates.size());
+	}
+}
+
+} // namespace
+
 void BuildSrtPlan(Program& program) {
 	if (program.resource_tracking_complete) {
 		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
 	}
 	program.srt_plan_complete = false;
+	LowerDynamicScalarBufferReads(program);
 	PlanBuilder(program).Run();
 	program.srt_plan_complete = true;
 }

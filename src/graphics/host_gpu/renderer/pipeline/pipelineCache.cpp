@@ -97,6 +97,19 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+// SRT walks evaluate scalar loads eagerly, including ones the shader only reaches under a
+// condition (a null acceleration-structure pointer, for instance). Unmapped guest memory
+// reads as zero instead of faulting on the host.
+bool ReadShaderSrtMemory(void*, uint64_t address, uint32_t* value) {
+	if (value == nullptr) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value))) {
+		*value = 0;
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -285,6 +298,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderSrtMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
